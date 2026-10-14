@@ -1,0 +1,50 @@
+# ==============================================================================
+# DayRecap - Git Ignore Configuration
+# ==============================================================================
+
+# --- Rust Compilation Outputs ---
+/target/
+**/*.rs.bk
+*.pdb
+*.exe
+!DayRecap.exe  # If you want to keep prebuilt portable binary, otherwise comment out
+
+# --- User Personal Activity Logs & Data ---
+# All sensitive personal activity history, clipboard captures, and raw TSV logs
+DayRecapData/
+*.tsv
+*.log
+*.sqlite
+*.db
+
+# --- Generated Reports & Office Exports ---
+# Protect proprietary client reports and turnover documents from accidental commit
+reports/
+*.docx
+*.xlsx
+*.pdf
+
+# --- Environment & Secret Credentials ---
+# Never leak Ollama/OpenAI API keys, Bearer tokens, or environment configs
+.env
+.env.*
+*.token
+*.key
+*.secret
+*.pem
+
+# --- IDE & Editor Configuration ---
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosv
+*.sln.docstates
+
+# --- Windows & OS System Files ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
