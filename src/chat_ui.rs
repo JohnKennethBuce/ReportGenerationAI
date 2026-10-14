@@ -1405,9 +1405,11 @@ unsafe fn send_chat_query(q: String) {
             return;
         }
         s.busy = true;
+        s.thinking_seconds = 0;
         s.cancel_flag.store(false, Ordering::SeqCst);
         EnableWindow(s.hwnd_stop as HWND, 1);
-        start_thinking_timer(s.hwnd_main as HWND);
+        let status = "🧠 Thinking (0s)... (Queue: Ingesting context & recent activity)";
+        SetWindowTextW(s.hwnd_status as HWND, wide(status).as_ptr());
         s.chat_history.push((true, q.clone()));
         (
             s.hwnd_main as HWND,
@@ -1416,6 +1418,7 @@ unsafe fn send_chat_query(q: String) {
             s.chat_history.clone(),
         )
     };
+    start_thinking_timer(hwnd_main);
 
     append_message("You", &q);
     let today = Local::now().date_naive();
@@ -1450,9 +1453,11 @@ unsafe fn send_chat_query_with_attachment(q: String, att: Attachment) {
             return;
         }
         s.busy = true;
+        s.thinking_seconds = 0;
         s.cancel_flag.store(false, Ordering::SeqCst);
         EnableWindow(s.hwnd_stop as HWND, 1);
-        start_thinking_timer(s.hwnd_main as HWND);
+        let status = "🧠 Thinking (0s)... (Queue: Ingesting context & recent activity)";
+        SetWindowTextW(s.hwnd_status as HWND, wide(status).as_ptr());
         let display_q = format!("📎 [Attached: {}]\r\n{}", att.filename, q);
         s.chat_history.push((true, display_q));
         (
@@ -1462,6 +1467,7 @@ unsafe fn send_chat_query_with_attachment(q: String, att: Attachment) {
             s.chat_history.clone(),
         )
     };
+    start_thinking_timer(hwnd_main);
 
     append_message("You", &format!("📎 [Attached: {}]\r\n{}", att.filename, q));
     let today = Local::now().date_naive();
@@ -1499,10 +1505,13 @@ unsafe fn trigger_rule_reports() {
         let full = SendMessageW(s.hwnd_chk_full_day as HWND, BM_GETCHECK, 0, 0) as usize
             == BST_CHECKED;
         s.busy = true;
+        s.thinking_seconds = 0;
         EnableWindow(s.hwnd_stop as HWND, 1);
-        start_thinking_timer(s.hwnd_main as HWND);
+        let status = "🧠 Thinking (0s)... (Queue: Ingesting context & recent activity)";
+        SetWindowTextW(s.hwnd_status as HWND, wide(status).as_ptr());
         (s.hwnd_main, s.hwnd_stop, full)
     };
+    start_thinking_timer(hwnd_main as HWND);
 
     let today = Local::now().date_naive();
     let active = rules::active_rule_names(today);
@@ -1557,10 +1566,13 @@ unsafe fn trigger_all_reports() {
         let full = SendMessageW(s.hwnd_chk_full_day as HWND, BM_GETCHECK, 0, 0) as usize
             == BST_CHECKED;
         s.busy = true;
+        s.thinking_seconds = 0;
         EnableWindow(s.hwnd_stop as HWND, 1);
-        start_thinking_timer(s.hwnd_main as HWND);
+        let status = "🧠 Thinking (0s)... (Queue: Ingesting context & recent activity)";
+        SetWindowTextW(s.hwnd_status as HWND, wide(status).as_ptr());
         (s.hwnd_main, s.hwnd_stop, full)
     };
+    start_thinking_timer(hwnd_main as HWND);
 
     let mode_str = if force_full {
         "Full Day 8 AM – 5 PM"
@@ -1597,13 +1609,6 @@ unsafe fn trigger_all_reports() {
 
 #[cfg(windows)]
 unsafe fn start_thinking_timer(hwnd: HWND) {
-    if let Some(lock) = UI.get() {
-        if let Ok(mut s) = lock.lock() {
-            s.thinking_seconds = 0;
-            let status = "🧠 Thinking (0s)... (Queue: Ingesting context & recent activity)";
-            SetWindowTextW(s.hwnd_status as HWND, wide(status).as_ptr());
-        }
-    }
     SetTimer(hwnd, IDT_THINKING_TIMER, 1000, None);
 }
 

@@ -849,10 +849,17 @@ fn handle_conversational_rules(date: NaiveDate, question: &str) -> Option<String
         || lower == "generate both"
         || lower == "run rules"
         || lower == "generate report"
-        || lower == "run reports";
+        || lower == "run reports"
+        || lower.contains("make our report")
+        || lower.contains("make my report")
+        || lower.contains("need my report")
+        || lower.contains("give me my report")
+        || lower.contains("generate my report")
+        || lower.contains("create my report")
+        || lower.contains("i need my report");
 
     if is_full_day_req || is_run_req {
-        let force_full = is_full_day_req;
+        let force_full = is_full_day_req || lower.contains("full") || lower.contains("whole");
         rules::set_active_rules(
             date,
             &[rules::RULE_WORD.to_string(), rules::RULE_EXCEL.to_string()],
@@ -866,11 +873,7 @@ fn handle_conversational_rules(date: NaiveDate, question: &str) -> Option<String
                     &format!("auto-adjusted for current time {}", Local::now().format("%I:%M %p"))
                 };
 
-                let preview = if force_full {
-                    format!("\n\n{}", generate_full_day_table_preview(date))
-                } else {
-                    String::new()
-                };
+                let preview = format!("\n\n{}", generate_full_day_table_preview(date));
 
                 Some(format!(
                     "✅ Activated both rules (`workReportFormatword` + `ExcelReportFormatExcel`) and generated your reports ({}):\n\n{}{}",
