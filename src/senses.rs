@@ -197,6 +197,13 @@ pub fn is_secret_or_noise(text: &str, app: &str, title: &str) -> bool {
 fn is_sensitive_window(app: &str, title: &str) -> bool {
     let t = title.to_lowercase();
     let a = app.to_lowercase();
+    if a.contains("dayrecap")
+        || a.contains("antigravity")
+        || t.contains("dayrecap —")
+        || t.contains("personal ai reporter")
+    {
+        return true;
+    }
     let blocked = [
         "login",
         "sign in",
@@ -559,21 +566,24 @@ fn git_log_for_dir(dir: &Path, date: NaiveDate) -> Vec<GitCommit> {
     result
 }
 
-/// Retrieve the most recent commits for a specific directory path, useful for schedule-split project synthesis.
+/// Retrieve the most recent commits for a specific directory path, including commit body bullets
+/// and modified file basenames (`--name-only`), deduplicating identical subjects for full-day synthesis.
 pub fn recent_commits_for_path(path: &std::path::Path, limit: usize) -> Vec<GitCommit> {
     let repo_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "repo".into());
+    let fetch_count = (limit * 2).max(12);
     let output = silent_git_cmd()
         .arg("-C")
         .arg(path)
         .arg("log")
         .arg("-n")
-        .arg(limit.to_string())
+        .arg(fetch_count.to_string())
         .arg("--no-merges")
         .arg("--date=format:%H:%M:%S")
-        .arg("--pretty=format:COMMIT|%h|%ad|%s")
+        .arg("--pretty=format:COMMIT_START|%h|%ad|%s%nBODY_START%n%b%nFILES_START")
+        .arg("--name-only")
         .output();
 
     let Ok(out) = output else { return Vec::new() };
@@ -581,26 +591,160 @@ pub fn recent_commits_for_path(path: &std::path::Path, limit: usize) -> Vec<GitC
         return Vec::new();
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut result = Vec::new();
+    let mut result: Vec<GitCommit> = Vec::new();
 
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("COMMIT|") {
-            let mut parts = rest.splitn(3, '|');
-            let hash = parts.next().unwrap_or("").to_string();
-            let time_str = parts.next().unwrap_or("09:00:00");
-            let subject = parts.next().unwrap_or("").to_string();
-            let time = NaiveTime::parse_from_str(time_str, TIME_FMT)
-                .unwrap_or_else(|_| NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+    #[derive(PartialEq)]
+    enum ParseMode {
+        None,
+        Body,
+        Files,
+    }
+
+    let mut mode = ParseMode::None;
+    let mut cur_hash = String::new();
+    let mut cur_time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+    let mut cur_subject = String::new();
+    let mut cur_body_points: Vec<String> = Vec::new();
+    let mut cur_files: Vec<String> = Vec::new();
+
+    let flush_commit = |result: &mut Vec<GitCommit>,
+                        hash: &mut String,
+                        time: NaiveTime,
+                        subject: &mut String,
+                        body_points: &mut Vec<String>,
+                        files: &mut Vec<String>| {
+        let subj_clean = subject
+            .replace("git add .", "")
+            .replace("git commit -F - << 'EOF'", "")
+            .trim()
+            .to_string();
+        if subj_clean.is_empty() {
+            hash.clear();
+            subject.clear();
+            body_points.clear();
+            files.clear();
+            return;
+        }
+
+        let files_str = if files.is_empty() {
+            String::new()
+        } else {
+            format!("Files: {}", files.join(", "))
+        };
+
+        let body_str = if body_points.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", truncate(&body_points.join("; "), 280))
+        };
+
+        let rich_subject = format!("{subj_clean}{body_str}");
+
+        // Deduplicate if an earlier commit had the exact same base subject title
+        if let Some(existing) = result.iter_mut().find(|c| {
+            c.subject == rich_subject
+                || c.subject.starts_with(&format!("{subj_clean} —"))
+                || c.subject == subj_clean
+        }) {
+            if existing.files_summary.is_empty() && !files_str.is_empty() {
+                existing.files_summary = files_str;
+            } else if !files.is_empty() {
+                for f in files.iter() {
+                    if !existing.files_summary.contains(f.as_str()) && existing.files_summary.len() < 180 {
+                        if existing.files_summary.is_empty() {
+                            existing.files_summary = format!("Files: {f}");
+                        } else {
+                            existing.files_summary.push_str(&format!(", {f}"));
+                        }
+                    }
+                }
+            }
+        } else {
             result.push(GitCommit {
                 time,
                 repo: repo_name.clone(),
-                hash,
-                subject,
-                files_summary: String::new(),
+                hash: hash.clone(),
+                subject: rich_subject,
+                files_summary: files_str,
             });
         }
+
+        hash.clear();
+        subject.clear();
+        body_points.clear();
+        files.clear();
+    };
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("COMMIT_START|") {
+            if !cur_subject.is_empty() {
+                flush_commit(
+                    &mut result,
+                    &mut cur_hash,
+                    cur_time,
+                    &mut cur_subject,
+                    &mut cur_body_points,
+                    &mut cur_files,
+                );
+            }
+            let mut parts = rest.splitn(3, '|');
+            cur_hash = parts.next().unwrap_or("").to_string();
+            let time_str = parts.next().unwrap_or("09:00:00");
+            cur_subject = parts.next().unwrap_or("").to_string();
+            cur_time = NaiveTime::parse_from_str(time_str, TIME_FMT)
+                .unwrap_or_else(|_| NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+            mode = ParseMode::None;
+        } else if trimmed == "BODY_START" {
+            mode = ParseMode::Body;
+        } else if trimmed == "FILES_START" {
+            mode = ParseMode::Files;
+        } else if !trimmed.is_empty() {
+            match mode {
+                ParseMode::Body => {
+                    if trimmed != "EOF"
+                        && !trimmed.starts_with("git add")
+                        && !trimmed.starts_with("git commit")
+                        && cur_body_points.len() < 4
+                    {
+                        let clean_b = trimmed
+                            .trim_start_matches(['-', '*', '•', ' '])
+                            .trim();
+                        if clean_b.len() >= 6 && !clean_b.eq_ignore_ascii_case(&cur_subject) {
+                            cur_body_points.push(clean_b.to_string());
+                        }
+                    }
+                }
+                ParseMode::Files => {
+                    if let Some(fname) = std::path::Path::new(trimmed)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                    {
+                        if !fname.ends_with(".md")
+                            && !cur_files.contains(&fname)
+                            && cur_files.len() < 6
+                        {
+                            cur_files.push(fname);
+                        }
+                    }
+                }
+                ParseMode::None => {}
+            }
+        }
     }
+
+    if !cur_subject.is_empty() {
+        flush_commit(
+            &mut result,
+            &mut cur_hash,
+            cur_time,
+            &mut cur_subject,
+            &mut cur_body_points,
+            &mut cur_files,
+        );
+    }
+
+    result.truncate(limit);
     result
 }
 
@@ -621,7 +765,10 @@ pub fn senses_for_hour(
             ));
         }
     }
-    for s in senses.iter().filter(|s| s.time.hour() == hour) {
+    for s in senses
+        .iter()
+        .filter(|s| s.time.hour() == hour && !is_sensitive_window(&s.app, &s.title))
+    {
         let label = if s.kind == "CLIP" { "Copied/Pasted" } else { "Typed note" };
         items.push(format!("{label} in {}: {}", s.app, s.content));
     }

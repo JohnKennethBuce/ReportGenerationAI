@@ -218,21 +218,36 @@ fn try_ai_rule_rows(
         &rule.title_target_col
     };
     let title_prefix = if rule.title_prefix.is_empty() {
-        "Araneta Mall Linking"
+        "Enterprise Mall Linking"
     } else {
         &rule.title_prefix
     };
 
+    let is_single_proj = rule.is_single_project_day();
+    let single_title = slots
+        .first()
+        .map(|s| s.assigned_title.as_str())
+        .filter(|t| !t.is_empty())
+        .unwrap_or(title_prefix);
+
     let title_mandate = if target_col_name.eq_ignore_ascii_case("Findings") {
-        format!(
-            "CRITICAL MANDATE - WORK TITLE PLACED ON COLUMN 3 (FINDINGS):\n\
-             - Column 2 (Cause): MUST start with 'Need ...' stating the architectural, security, operational, or business reason (e.g. 'Need single-instance enforcement to prevent race conditions...'). Do NOT prepend any project title to Cause.\n\
-             - Column 3 (Findings): MUST start with the SLOT's Assigned Work Title prefix (e.g. 'Enterprise Mall Linking – ' or 'Atc & Araneta Mall Linking – ') followed by concrete technical work completed or turnover conducted, naming specific classes, methods, forms, services, and outcomes on that specific codebase. NEVER attribute work to background tools like DayRecap or Antigravity."
-        )
+        if is_single_proj {
+            format!(
+                "CRITICAL MANDATE - UNIFIED SINGLE PROJECT ACROSS ALL 8 HOURS (COLUMN 3 FINDINGS):\n\
+                 - Column 2 (Cause): MUST start with 'Need ...' stating the architectural, security, operational, or business reason. Do NOT prepend any project title to Cause.\n\
+                 - Column 3 (Findings): EVERY SINGLE ROW across the entire day (8:00 AM – 5:00 PM) MUST start with the exact prefix '{single_title} – ' followed by concrete technical work completed from that slot's Git commit evidence, naming the exact classes, methods, files, and outcomes. Do NOT include any other project title (NEVER write 'Atc & Araneta Mall Linking' if the assigned title is '{single_title}') and NEVER attribute work to background tools like DayRecap or Antigravity."
+            )
+        } else {
+            format!(
+                "CRITICAL MANDATE - WORK TITLE PLACED ON COLUMN 3 (FINDINGS):\n\
+                 - Column 2 (Cause): MUST start with 'Need ...' stating the architectural, security, operational, or business reason. Do NOT prepend any project title to Cause.\n\
+                 - Column 3 (Findings): MUST start with the SLOT's Assigned Work Title prefix followed by concrete technical work completed or turnover conducted, naming specific classes, methods, forms, services, and outcomes on that specific codebase. NEVER attribute work to background tools like DayRecap or Antigravity."
+            )
+        }
     } else {
         format!(
             "CRITICAL MANDATE - WORK TITLE PLACED ON COLUMN 2 (CAUSE):\n\
-             - Column 2 (Cause): MUST start with the SLOT's Assigned Work Title prefix (e.g. '<Title> - Need ...') stating the architectural, security, operational, or business reason.\n\
+             - Column 2 (Cause): MUST start with the SLOT's Assigned Work Title prefix (e.g. '{single_title} - Need ...') stating the architectural, security, operational, or business reason.\n\
              - Column 3 (Findings): Concrete technical work completed on that codebase. NEVER attribute work to background tools like DayRecap or Antigravity."
         )
     };
@@ -292,9 +307,16 @@ fn try_ai_rule_rows(
                     } else {
                         val = enforce_clean_cause(&val);
                     }
+                    if is_single_proj && slot_title.eq_ignore_ascii_case("Enterprise Mall Linking") {
+                        val = val.replace("for Atc & Araneta Mall Linking", "for Enterprise Mall Linking");
+                        val = val.replace("Atc & Araneta Mall Linking", "Enterprise Mall Linking");
+                    }
                 } else if col_name.eq_ignore_ascii_case("Findings") {
                     if target_col_name.eq_ignore_ascii_case("Findings") {
                         val = enforce_findings_title_prefix(&val, slot_title, &slot.primary_project);
+                    }
+                    if is_single_proj && slot_title.eq_ignore_ascii_case("Enterprise Mall Linking") {
+                        val = val.replace("Atc & Araneta Mall Linking", "Enterprise Mall Linking");
                     }
                 }
 
@@ -390,6 +412,33 @@ fn synthesize_fallback_row(rule: &RuleProfile, slot: &CleanedHourSlot, columns: 
     ReportRow { cols }
 }
 
+fn derive_cause_from_slot(slot: &CleanedHourSlot) -> String {
+    for ev in &slot.work_evidence {
+        if let Some(idx) = ev.find("): ") {
+            let after = &ev[idx + 3..];
+            let base = after.split(" — ").next().unwrap_or(after).split(" (Files:").next().unwrap_or(after).trim();
+            // Strip conventional commit prefix like `feat(monitor): ` or `perf: ` or `fix(ingestion): `
+            let summary = if let Some(c_idx) = base.find(": ") {
+                if c_idx <= 30 {
+                    base[c_idx + 2..].trim()
+                } else {
+                    base
+                }
+            } else {
+                base
+            };
+            if !summary.is_empty() {
+                return format!("Need to {summary} to ensure reliable system performance, data integrity, and compliance.");
+            }
+        }
+    }
+    if slot.is_predicted_tail {
+        "Need final configuration integration, edge-case handling, and end-to-end verification across entry points.".into()
+    } else {
+        "Need focused engineering analysis, implementation, and workflow progression.".into()
+    }
+}
+
 fn fallback_col_value(rule: &RuleProfile, slot: &CleanedHourSlot, col_idx: usize) -> String {
     let slot_title = if !slot.assigned_title.trim().is_empty() {
         &slot.assigned_title
@@ -412,16 +461,10 @@ fn fallback_col_value(rule: &RuleProfile, slot: &CleanedHourSlot, col_idx: usize
         0 => slot.time_label.clone(),
         1 => {
             // Cause
-            let cause_body = if slot.is_predicted_tail {
-                "Need final configuration integration, edge-case handling, and end-to-end verification across entry points."
-            } else if slot.work_evidence.iter().any(|e| e.starts_with("Git commit")) {
-                "Need clean implementation, code verification, and version-controlled delivery."
-            } else {
-                "Need focused engineering analysis, implementation, and workflow progression."
-            };
+            let cause_body = derive_cause_from_slot(slot);
 
             if is_findings_target {
-                enforce_clean_cause(cause_body)
+                enforce_clean_cause(&cause_body)
             } else {
                 format!("{proj} - {cause_body}")
             }
@@ -622,7 +665,7 @@ pub fn engine_label() -> String {
 /// Answer a chat question or execute a conversational Rule / Dissect / Memory command.
 pub fn chat_answer(date: NaiveDate, history: &[(bool, String)], question: &str) -> String {
     // 1. Check if the user is interacting with Rules, Dissecting a doc/table, or teaching Memory
-    if let Some(rule_reply) = handle_conversational_rules(date, question) {
+    if let Some(rule_reply) = handle_conversational_rules_with_history(date, history, question) {
         return rule_reply;
     }
 
@@ -654,7 +697,7 @@ pub fn chat_answer(date: NaiveDate, history: &[(bool, String)], question: &str) 
             );
         }
     } else if cfg.tracking.enable_git_sense {
-        let recent = senses::recent_git_commits(&cfg.tracking.project_dirs, 6);
+        let recent = senses::recent_git_commits(&cfg.tracking.project_dirs, 8);
         if !recent.is_empty() {
             senses_summary += "\nRecent Commits from Monitored Repositories:\n";
             for r in recent {
@@ -702,13 +745,19 @@ pub fn chat_answer(date: NaiveDate, history: &[(bool, String)], question: &str) 
          Learned user rules/notes:\n{learned}\n\n\
          Current time: {}\n\
          Activity log:\n{data}\n{senses_summary}\n\n\
+         AUTONOMOUS SELF-MODIFICATION & CLARIFICATION DIRECTIVES:\n\
+         - If the user asks to focus the entire day on ONE project (or exclude another project), begin your reply with:\n\
+           `[ACTION: SINGLE_PROJECT | <Project Title> | <Repo Path>]`\n\
+         - If the user asks to generate or regenerate the full-day report, begin your reply with:\n\
+           `[ACTION: GENERATE_FULL_DAY]`\n\
+         - If the user's request about which project or repository to use is genuinely ambiguous, DO NOT guess—ask a polite, concise clarification question listing the available repositories.\n\n\
          FULL DAY REPORT & STANDUP GUIDELINES:\n\
          - When generating or filling a work report or daily standup across the full working day (8:00 AM – 5:00 PM excluding 12:00–1:00 PM lunch):\n\
            Always provide all 8 hourly rows: 8:00 AM – 9:00 AM, 9:00 AM – 10:00 AM, 10:00 AM – 11:00 AM, 11:00 AM – 12:00 PM, 1:00 PM – 2:00 PM, 2:00 PM – 3:00 PM, 3:00 PM – 4:00 PM, 4:00 PM – 5:00 PM.\n\
            Follow columns: Time | Cause | Findings.\n\
            For Cause: start with 'Need ...' stating the architectural, security, or business reason.\n\
-           For Findings: detail concrete technical work completed, naming specific classes, methods, and outcomes based on the user's active codebase (e.g. MallLinking: named mutex single-instance startup, PBKDF2 password security, table inspector, transaction ingestion, regression testing).\n\
-           NEVER mark afternoon hours as 'idle' or 'no activity recorded'—project progressive engineering milestones for the user's primary project throughout the entire day.\n\
+           For Findings: detail concrete technical work completed, naming specific classes, methods, and outcomes based on the user's active codebase.\n\
+           Strictly obey the active project title mandate (never mix in a second project title if the user requested only one project).\n\
          Answer concisely in {}. Plain text or markdown table only.",
         repos_line,
         Local::now().format("%A %Y-%m-%d %H:%M"),
@@ -725,10 +774,56 @@ pub fn chat_answer(date: NaiveDate, history: &[(bool, String)], question: &str) 
     }
     msgs.push(Msg::user(question));
 
-    llm::complete(&ep, &msgs).unwrap_or_else(|e| format!("Sorry - {e}"))
+    let raw_reply = llm::complete(&ep, &msgs).unwrap_or_else(|e| format!("Sorry - {e}"));
+    process_llm_action_directives(date, &raw_reply)
 }
 
+fn process_llm_action_directives(date: NaiveDate, raw_reply: &str) -> String {
+    let mut cleaned_lines = Vec::new();
+    let mut triggered_report = false;
+
+    for line in raw_reply.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[ACTION:") && trimmed.ends_with(']') {
+            let inner = &trimmed[8..trimmed.len() - 1];
+            let parts: Vec<&str> = inner.split('|').map(|s| s.trim()).collect();
+            if let Some(&cmd) = parts.first() {
+                if cmd.eq_ignore_ascii_case("SINGLE_PROJECT") && parts.len() >= 3 {
+                    let title = parts[1];
+                    let repo = parts[2];
+                    apply_single_project_to_rules_and_memory(title, repo, "Findings");
+                    let _ = fs::remove_file(paths::digest_file(date));
+                    let _ = generate_rule_reports_with_mode(date, true);
+                    triggered_report = true;
+                } else if cmd.eq_ignore_ascii_case("GENERATE_FULL_DAY") {
+                    let _ = fs::remove_file(paths::digest_file(date));
+                    let _ = generate_rule_reports_with_mode(date, true);
+                    triggered_report = true;
+                }
+            }
+        } else {
+            cleaned_lines.push(line);
+        }
+    }
+
+    let mut out = cleaned_lines.join("\n").trim().to_string();
+    if triggered_report && !out.contains("| 8:00 AM") {
+        out.push_str("\n\n");
+        out.push_str(&generate_full_day_table_preview(date));
+    }
+    out
+}
+
+#[allow(dead_code)]
 fn handle_conversational_rules(date: NaiveDate, question: &str) -> Option<String> {
+    handle_conversational_rules_with_history(date, &[], question)
+}
+
+fn handle_conversational_rules_with_history(
+    date: NaiveDate,
+    history: &[(bool, String)],
+    question: &str,
+) -> Option<String> {
     let q_trim = question.trim();
     let lower = q_trim.to_lowercase();
 
@@ -750,7 +845,7 @@ fn handle_conversational_rules(date: NaiveDate, question: &str) -> Option<String
         "list projects",
         "tracked repos",
     ];
-    if file_keywords.iter().any(|k| lower.contains(k)) {
+    if file_keywords.iter().any(|k| lower.contains(k)) && !lower.contains("generate report") {
         let cfg = config::load();
         let repos = senses::list_tracked_repos(&cfg.tracking.project_dirs);
         let mut out = format!(
@@ -829,64 +924,7 @@ fn handle_conversational_rules(date: NaiveDate, question: &str) -> Option<String
         }
     }
 
-    // 2. Run / Generate Word & Excel reports via chat command (auto-adjusted or full day)
-    let is_full_day_req = (lower.contains("fill")
-        && (lower.contains("8-5")
-            || lower.contains("8 to 5")
-            || lower.contains("whole day")
-            || lower.contains("all day")
-            || lower.contains("long")))
-        || lower.contains("whole day 8-5")
-        || lower.contains("fill 8-5")
-        || lower.contains("fill my whole day")
-        || lower.contains("fill whole day")
-        || lower.contains("full day report")
-        || lower.contains("full report")
-        || (lower.contains("generate report") && lower.contains("combining"));
-
-    let is_run_req = lower == "run both"
-        || lower == "generate word and excel"
-        || lower == "generate both"
-        || lower == "run rules"
-        || lower == "generate report"
-        || lower == "run reports"
-        || lower.contains("make our report")
-        || lower.contains("make my report")
-        || lower.contains("need my report")
-        || lower.contains("give me my report")
-        || lower.contains("generate my report")
-        || lower.contains("create my report")
-        || lower.contains("i need my report");
-
-    if is_full_day_req || is_run_req {
-        let force_full = is_full_day_req || lower.contains("full") || lower.contains("whole");
-        rules::set_active_rules(
-            date,
-            &[rules::RULE_WORD.to_string(), rules::RULE_EXCEL.to_string()],
-        );
-        return match generate_rule_reports_with_mode(date, force_full) {
-            Ok(files) => {
-                let list: Vec<String> = files.iter().map(|p| format!("• {}", p.display())).collect();
-                let mode_desc = if force_full {
-                    "Full Day 8:00 AM – 5:00 PM schedule (all 8 hours filled with progressive engineering milestones)"
-                } else {
-                    &format!("auto-adjusted for current time {}", Local::now().format("%I:%M %p"))
-                };
-
-                let preview = format!("\n\n{}", generate_full_day_table_preview(date));
-
-                Some(format!(
-                    "✅ Activated both rules (`workReportFormatword` + `ExcelReportFormatExcel`) and generated your reports ({}):\n\n{}{}",
-                    mode_desc,
-                    list.join("\n"),
-                    preview
-                ))
-            }
-            Err(e) => Some(format!("Could not generate rule reports: {e}")),
-        };
-    }
-
-    // 3. Teach / Remember a persistent rule note
+    // 2. Teach / Remember a persistent rule note
     if lower
         .strip_prefix("remember:")
         .or_else(|| lower.strip_prefix("add rule:"))
@@ -975,44 +1013,12 @@ fn handle_conversational_rules(date: NaiveDate, question: &str) -> Option<String
             "Mall_Linking"
         };
 
-        let splits = vec![
-            rules::ScheduleSplit {
-                start_hour: 8,
-                end_hour: 12,
-                project_title: morning_title.to_string(),
-                repo_path: morning_repo.clone(),
-            },
-            rules::ScheduleSplit {
-                start_hour: 13,
-                end_hour: 17,
-                project_title: afternoon_title.to_string(),
-                repo_path: afternoon_repo.clone(),
-            },
-        ];
-
-        let new_instructions = format!(
-            "Follow this exact engineering report style for every hourly row:\n\
-             - Column 1 (Time): Hourly range such as \"8:00 AM – 9:00 AM\" (skipping 12:00 PM – 1:00 PM lunch).\n\
-             - Column 2 (Cause): Start with \"Need ...\" stating the architectural, security, operational, or business reason why this hour's work was needed.\n\
-             - Column 3 (Findings): MUST start with the assigned Work/Project Title prefix:\n\
-               • Hours 8:00 AM – 12:00 PM: Prefix with \"{morning_title} – \" naming specific classes, methods, and outcomes completed on {morning_repo}.\n\
-               • Hours 1:00 PM – 5:00 PM: Prefix with \"{afternoon_title} – \" naming specific classes, methods, and outcomes completed on {afternoon_repo}.\n\
-             - Clean out any irrelevant searches or distractions and attribute the full hour to the main project worked on.\n\
-             - For the final 4:00 PM – 5:00 PM slot (when triggered at 4:40 PM), synthesize and predict the final integration and end-to-end verification completing the afternoon's work."
-        );
-
         if let Some(mut w_rule) = rules::load_rule(rules::RULE_WORD) {
-            w_rule.schedule_splits = splits.clone();
-            w_rule.title_target_col = "Findings".into();
-            w_rule.title_prefix = morning_title.into();
-            w_rule.instructions = new_instructions.clone();
+            w_rule.apply_split_projects(morning_title, &morning_repo, afternoon_title, &afternoon_repo);
             let _ = rules::save_rule(&w_rule);
         }
         if let Some(mut e_rule) = rules::load_rule(rules::RULE_EXCEL) {
-            e_rule.schedule_splits = splits.clone();
-            e_rule.title_target_col = "Findings".into();
-            e_rule.title_prefix = morning_title.into();
-            e_rule.instructions = new_instructions;
+            e_rule.apply_split_projects(morning_title, &morning_repo, afternoon_title, &afternoon_repo);
             let _ = rules::save_rule(&e_rule);
         }
 
@@ -1025,11 +1031,12 @@ fn handle_conversational_rules(date: NaiveDate, question: &str) -> Option<String
         }
         let _ = config::save(&cfg);
 
-        let _ = rules::add_learned_note(&format!(
+        let _ = rules::set_project_schedule_memory(&format!(
             "Multi-Project Schedule Configured:\n• 8:00 AM – 12:00 PM: Title \"{morning_title}\" (Repo: {morning_repo})\n• 1:00 PM – 5:00 PM: Title \"{afternoon_title}\" (Repo: {afternoon_repo})\n• All reports saved in centralized isolated directory: {}\n• Findings start with the respective project title.",
             paths::reports_dir().display()
         ));
 
+        let _ = fs::remove_file(paths::digest_file(date));
         let files = generate_rule_reports_with_mode(date, true).unwrap_or_default();
         let preview = generate_full_day_table_preview(date);
 
@@ -1050,29 +1057,81 @@ fn handle_conversational_rules(date: NaiveDate, question: &str) -> Option<String
         ));
     }
 
-    // 5.6 Natural Language Report Generation Command (without relying strictly on buttons)
-    if (lower.contains("make our report")
+    // 5.6 Autonomous Single-Project Unification, Exclusion, History Resolution & Clarification
+    if let Some(single_proj_reply) = handle_single_project_or_clarification(date, history, q_trim) {
+        return Some(single_proj_reply);
+    }
+
+    // 5.7 Run / Generate Word & Excel reports via chat command (auto-adjusted or full day)
+    let is_full_day_req = (lower.contains("fill")
+        && (lower.contains("8-5")
+            || lower.contains("8 to 5")
+            || lower.contains("whole day")
+            || lower.contains("all day")
+            || lower.contains("long")))
+        || lower.contains("whole day 8-5")
+        || lower.contains("fill 8-5")
+        || lower.contains("fill my whole day")
+        || lower.contains("fill whole day")
+        || lower.contains("full day report")
+        || lower.contains("full report")
+        || (lower.contains("generate report") && lower.contains("combining"));
+
+    let is_run_req = lower == "run both"
+        || lower == "generate word and excel"
+        || lower == "generate both"
+        || lower == "run rules"
+        || lower == "generate report"
+        || lower == "run reports"
+        || lower.contains("make our report")
+        || lower.contains("make my report")
         || lower.contains("make the report")
         || lower.contains("make report")
         || lower.contains("create report")
-        || lower.contains("generate report")
-        || lower.contains("run report"))
-        && !lower.contains("how ")
-        && !lower.contains("trigger time")
-        && !lower.contains("language")
-    {
+        || lower.contains("run report")
+        || lower.contains("need my report")
+        || lower.contains("give me my report")
+        || lower.contains("generate my report")
+        || lower.contains("create my report")
+        || lower.contains("i need my report")
+        || (lower.contains("generate report")
+            && !lower.contains("how ")
+            && !lower.contains("trigger time")
+            && !lower.contains("language"));
+
+    if is_full_day_req || is_run_req {
+        let force_full = is_full_day_req
+            || lower.contains("full")
+            || lower.contains("whole")
+            || lower.contains("make our report")
+            || lower.contains("generate report");
+        if force_full {
+            let _ = fs::remove_file(paths::digest_file(date));
+        }
         rules::set_active_rules(
             date,
             &[rules::RULE_WORD.to_string(), rules::RULE_EXCEL.to_string()],
         );
-        let files = generate_rule_reports_with_mode(date, true).unwrap_or_default();
-        let preview = generate_full_day_table_preview(date);
-        return Some(format!(
-            "✅ Generated Today's Work Reports in `{}`:\n{}\n\n{}",
-            paths::reports_dir().display(),
-            files.iter().map(|p| format!("• {}", p.display())).collect::<Vec<_>>().join("\n"),
-            preview
-        ));
+        return match generate_rule_reports_with_mode(date, force_full) {
+            Ok(files) => {
+                let list: Vec<String> = files.iter().map(|p| format!("• {}", p.display())).collect();
+                let mode_desc = if force_full {
+                    "Full Day 8:00 AM – 5:00 PM schedule (all 8 hours filled with progressive engineering milestones)"
+                } else {
+                    &format!("auto-adjusted for current time {}", Local::now().format("%I:%M %p"))
+                };
+
+                let preview = format!("\n\n{}", generate_full_day_table_preview(date));
+
+                Some(format!(
+                    "✅ Activated both rules (`workReportFormatword` + `ExcelReportFormatExcel`) and generated your reports ({}):\n\n{}{}",
+                    mode_desc,
+                    list.join("\n"),
+                    preview
+                ))
+            }
+            Err(e) => Some(format!("Could not generate rule reports: {e}")),
+        };
     }
 
     // 6. Autonomous Self-Modifying Adaptation: Move Title to Findings (or Cause)
@@ -1097,47 +1156,22 @@ fn handle_conversational_rules(date: NaiveDate, question: &str) -> Option<String
 
     if is_title_instruction || is_move_to_cause {
         let target_col = if is_move_to_cause { "Cause" } else { "Findings" };
-        let title_name = "Araneta Mall Linking";
-
-        let new_instructions = if target_col == "Findings" {
-            format!(
-                "Follow this exact engineering report style for every hourly row:\n\
-                 - Column 1 (Time): Hourly range such as \"8:00 AM – 9:00 AM\" (skipping 12:00 PM – 1:00 PM lunch).\n\
-                 - Column 2 (Cause): Start with \"Need ...\" stating the architectural, security, operational, or business reason why this hour's work was needed (e.g. \"Need single-instance enforcement to prevent race conditions...\" or \"Need enterprise-grade password security and timing-attack mitigation...\").\n\
-                 - Column 3 (Findings): MUST start with the Work/Project Title prefix: \"{title_name} – \" followed by concrete technical work completed or turnover conducted, naming specific classes, methods, forms, services, and outcomes on the user's active codebase (MallLinking: e.g. \"{title_name} – Implemented single-instance application control in Program.cs utilizing named mutex (AppMutexName)...\" or \"{title_name} – Built a static PasswordService implementing PBKDF2...\"). NEVER attribute work to background tools like DayRecap or Antigravity.\n\
-                 - Clean out any irrelevant searches or distractions and attribute the full hour to the main project worked on ({title_name}).\n\
-                 - For the final 4:00 PM – 5:00 PM slot (when triggered at 4:40 PM), synthesize and predict the final integration and end-to-end verification completing the afternoon's work."
-            )
+        let title_name = if lower.contains("enterprise mall linking") {
+            "Enterprise Mall Linking"
+        } else if lower.contains("atc & araneta") || lower.contains("atc and araneta") {
+            "Atc & Araneta Mall Linking"
         } else {
-            format!(
-                "Follow this exact engineering report style for every hourly row:\n\
-                 - Column 1 (Time): Hourly range such as \"8:00 AM – 9:00 AM\" (skipping 12:00 PM – 1:00 PM lunch).\n\
-                 - Column 2 (Cause): MUST start with the Work Title prefix: \"{title_name} - Need ...\" stating the architectural, security, operational, or business reason why this hour's work was needed.\n\
-                 - Column 3 (Findings): Concrete technical work completed on the user's active codebase (MallLinking).\n\
-                 - Clean out any irrelevant searches or distractions and attribute the full hour to the main project worked on ({title_name}).\n\
-                 - For the final 4:00 PM – 5:00 PM slot (when triggered at 4:40 PM), synthesize and predict the final integration and end-to-end verification completing the afternoon's work."
-            )
+            "Araneta Mall Linking"
         };
 
-        if let Some(mut w_rule) = rules::load_rule(rules::RULE_WORD) {
-            w_rule.title_target_col = target_col.into();
-            w_rule.title_prefix = title_name.into();
-            w_rule.instructions = new_instructions.clone();
-            let _ = rules::save_rule(&w_rule);
-        }
-        if let Some(mut e_rule) = rules::load_rule(rules::RULE_EXCEL) {
-            e_rule.title_target_col = target_col.into();
-            e_rule.title_prefix = title_name.into();
-            e_rule.instructions = new_instructions;
-            let _ = rules::save_rule(&e_rule);
-        }
-
-        let memory_note = if target_col == "Findings" {
-            format!("Mandatory Work Title: Always place '{title_name} – ' in Column 3 (Findings). Column 2 (Cause) starts cleanly with 'Need ...'.")
+        let repo_path = if title_name == "Atc & Araneta Mall Linking" {
+            r"C:\Users\MIS jap\source\repos\Mall_Linking"
         } else {
-            format!("Mandatory Work Title: Always prepend '{title_name} - Need ...' to every row's Cause.")
+            r"C:\Users\MIS jap\source\repos\MallLinking"
         };
-        let _ = rules::add_learned_note(&memory_note);
+
+        apply_single_project_to_rules_and_memory(title_name, repo_path, target_col);
+        let _ = fs::remove_file(paths::digest_file(date));
 
         let files = generate_rule_reports_with_mode(date, true).unwrap_or_default();
         let preview = generate_full_day_table_preview(date);
@@ -1312,6 +1346,434 @@ fn handle_conversational_rules(date: NaiveDate, question: &str) -> Option<String
     }
 
     None
+}
+
+fn apply_single_project_to_rules_and_memory(title: &str, repo_path: &str, target_col: &str) {
+    if let Some(mut w_rule) = rules::load_rule(rules::RULE_WORD) {
+        w_rule.apply_single_project(title, repo_path, target_col);
+        let _ = rules::save_rule(&w_rule);
+    }
+    if let Some(mut e_rule) = rules::load_rule(rules::RULE_EXCEL) {
+        e_rule.apply_single_project(title, repo_path, target_col);
+        let _ = rules::save_rule(&e_rule);
+    }
+
+    let mut cfg = config::load();
+    if !repo_path.is_empty()
+        && !cfg
+            .tracking
+            .project_dirs
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(repo_path))
+    {
+        cfg.tracking.project_dirs.push(repo_path.to_string());
+        let _ = config::save(&cfg);
+    }
+
+    let memory_note = if target_col.eq_ignore_ascii_case("Cause") {
+        format!(
+            "Single-Project Full-Day Schedule Configured:\n• All Hours (8:00 AM – 5:00 PM): Title \"{title}\" (Repo: {repo_path})\n• Mandatory Work Title: Always prepend '{title} - Need ...' to every row's Cause."
+        )
+    } else {
+        format!(
+            "Single-Project Full-Day Schedule Configured:\n• All Hours (8:00 AM – 5:00 PM): Title \"{title}\" (Repo: {repo_path})\n• Mandatory Work Title: Always place '{title} – ' in Column 3 (Findings) for all 8 hours (8:00 AM – 5:00 PM). NEVER include any second project title."
+        )
+    };
+    let _ = rules::set_project_schedule_memory(&memory_note);
+}
+
+#[derive(Debug, Default)]
+struct ProjectIntentAnalysis {
+    positive_projects: Vec<(String, String)>,
+    excluded_titles: Vec<String>,
+}
+
+fn analyze_project_mentions(text: &str) -> ProjectIntentAnalysis {
+    let mut analysis = ProjectIntentAnalysis::default();
+
+    // 1. Check explicit Windows paths first
+    for path_str in extract_all_windows_paths(text) {
+        let lower_p = path_str.to_lowercase();
+        let title = if lower_p.contains("mall_linking") {
+            "Atc & Araneta Mall Linking".to_string()
+        } else if lower_p.contains("malllinking") {
+            "Enterprise Mall Linking".to_string()
+        } else {
+            Path::new(&path_str)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Primary Project".to_string())
+        };
+        if !analysis
+            .positive_projects
+            .iter()
+            .any(|(t, _)| t.eq_ignore_ascii_case(&title))
+        {
+            analysis.positive_projects.push((title, path_str));
+        }
+    }
+
+    // 2. Clause-level analysis for named titles and negations/exclusions
+    let clauses: Vec<&str> = text
+        .split(['.', ',', ';', '\n', '!', '?'])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut last_clause_project: Option<String> = None;
+
+    for clause in clauses {
+        let c_low = clause.to_lowercase();
+        let has_negation = c_low.contains("not include")
+            || c_low.contains("don't include")
+            || c_low.contains("dont include")
+            || c_low.contains("do not include")
+            || c_low.contains("still put")
+            || c_low.contains("still have")
+            || c_low.contains("still show")
+            || c_low.contains("still using")
+            || c_low.contains("don't want")
+            || c_low.contains("dont want")
+            || c_low.contains("do not want")
+            || c_low.contains("remove ")
+            || c_low.contains("exclude ")
+            || c_low.contains("stop putting")
+            || c_low.contains("no more ")
+            || c_low.contains("without ")
+            || c_low.contains("instead of")
+            || c_low.contains("why is there")
+            || c_low.contains("why there is");
+
+        let mentions_atc = c_low.contains("atc & araneta")
+            || c_low.contains("atc and araneta")
+            || c_low.contains("mall_linking");
+        let mentions_enterprise = c_low.contains("enterprise mall linking")
+            || c_low.contains("enterprise mall")
+            || (c_low.contains("malllinking") && !c_low.contains("mall_linking"));
+        let mentions_araneta_only = !mentions_atc && c_low.contains("araneta mall linking");
+
+        if mentions_atc {
+            let title = "Atc & Araneta Mall Linking".to_string();
+            let repo = r"C:\Users\MIS jap\source\repos\Mall_Linking".to_string();
+            if has_negation {
+                if !analysis.excluded_titles.contains(&title) {
+                    analysis.excluded_titles.push(title.clone());
+                }
+                analysis
+                    .positive_projects
+                    .retain(|(t, _)| !t.eq_ignore_ascii_case(&title));
+            } else if !analysis.excluded_titles.contains(&title)
+                && !analysis
+                    .positive_projects
+                    .iter()
+                    .any(|(t, _)| t.eq_ignore_ascii_case(&title))
+            {
+                analysis.positive_projects.push((title.clone(), repo));
+            }
+            last_clause_project = Some(title);
+        }
+
+        if mentions_enterprise {
+            let title = "Enterprise Mall Linking".to_string();
+            let repo = r"C:\Users\MIS jap\source\repos\MallLinking".to_string();
+            if has_negation {
+                if !analysis.excluded_titles.contains(&title) {
+                    analysis.excluded_titles.push(title.clone());
+                }
+                analysis
+                    .positive_projects
+                    .retain(|(t, _)| !t.eq_ignore_ascii_case(&title));
+            } else if !analysis.excluded_titles.contains(&title)
+                && !analysis
+                    .positive_projects
+                    .iter()
+                    .any(|(t, _)| t.eq_ignore_ascii_case(&title))
+            {
+                analysis.positive_projects.push((title.clone(), repo));
+            }
+            last_clause_project = Some(title);
+        }
+
+        if mentions_araneta_only {
+            let title = "Araneta Mall Linking".to_string();
+            let repo = r"C:\Users\MIS jap\source\repos\MallLinking".to_string();
+            if has_negation {
+                if !analysis.excluded_titles.contains(&title) {
+                    analysis.excluded_titles.push(title.clone());
+                }
+                analysis
+                    .positive_projects
+                    .retain(|(t, _)| !t.eq_ignore_ascii_case(&title));
+            } else if !analysis.excluded_titles.contains(&title)
+                && !analysis
+                    .positive_projects
+                    .iter()
+                    .any(|(t, _)| t.eq_ignore_ascii_case(&title))
+            {
+                analysis.positive_projects.push((title.clone(), repo));
+            }
+            last_clause_project = Some(title);
+        }
+
+        // Anaphora resolution: e.g. "you still put Atc & Araneta Mall Linking, I already commanded you to not include that"
+        if !mentions_atc && !mentions_enterprise && !mentions_araneta_only && has_negation {
+            if (c_low.contains("that") || c_low.contains("it") || c_low.contains("this title"))
+                && last_clause_project.is_some()
+            {
+                if let Some(prev_title) = &last_clause_project {
+                    if !analysis.excluded_titles.contains(prev_title) {
+                        analysis.excluded_titles.push(prev_title.clone());
+                    }
+                    analysis
+                        .positive_projects
+                        .retain(|(t, _)| !t.eq_ignore_ascii_case(prev_title));
+                }
+            }
+        }
+    }
+
+    analysis
+}
+
+fn resolve_project_from_history(
+    history: &[(bool, String)],
+    date: NaiveDate,
+) -> Option<(String, String)> {
+    // 1. Check in-memory conversation history (user turns, most recent first)
+    for (is_user, text) in history.iter().rev() {
+        if !*is_user {
+            continue;
+        }
+        let analysis = analyze_project_mentions(text);
+        if analysis.positive_projects.len() == 1 {
+            return analysis.positive_projects.into_iter().next();
+        }
+    }
+
+    // 2. Fallback: inspect saved chat log for `date` (`[HH:MM] You: ...` lines)
+    if let Ok(raw_chat) = fs::read_to_string(paths::chat_file(date)) {
+        let user_lines: Vec<&str> = raw_chat
+            .lines()
+            .filter(|l| l.contains("] You:"))
+            .collect();
+        for line in user_lines.into_iter().rev() {
+            let analysis = analyze_project_mentions(line);
+            if analysis.positive_projects.len() == 1 {
+                return analysis.positive_projects.into_iter().next();
+            }
+        }
+    }
+
+    None
+}
+
+fn handle_single_project_or_clarification(
+    date: NaiveDate,
+    history: &[(bool, String)],
+    q_trim: &str,
+) -> Option<String> {
+    let lower = q_trim.to_lowercase();
+    let analysis = analyze_project_mentions(q_trim);
+
+    // Case A: User asks why there are 2 different titles when they only mentioned 1 path/project
+    let is_why_two_titles = (lower.contains("2 different titles")
+        || lower.contains("two different titles")
+        || lower.contains("2 titles")
+        || lower.contains("two titles")
+        || lower.contains("only 1 path")
+        || lower.contains("only one path"))
+        && (lower.contains("why") || lower.contains("report") || lower.contains("title"));
+
+    if is_why_two_titles {
+        let (title, repo_path) = analysis
+            .positive_projects
+            .first()
+            .cloned()
+            .or_else(|| resolve_project_from_history(history, date))
+            .unwrap_or_else(|| {
+                (
+                    "Enterprise Mall Linking".to_string(),
+                    r"C:\Users\MIS jap\source\repos\MallLinking".to_string(),
+                )
+            });
+
+        apply_single_project_to_rules_and_memory(&title, &repo_path, "Findings");
+        let _ = fs::remove_file(paths::digest_file(date));
+        rules::set_active_rules(
+            date,
+            &[rules::RULE_WORD.to_string(), rules::RULE_EXCEL.to_string()],
+        );
+        let files = generate_rule_reports_with_mode(date, true).unwrap_or_default();
+        let preview = generate_full_day_table_preview(date);
+
+        return Some(format!(
+            "💡 **Why 2 Titles Appeared & How I Fixed It Immediately:**\n\n\
+             Earlier, your saved rule profile still had a **morning/afternoon schedule split** (`8:00 AM – 12:00 PM: Enterprise Mall Linking` and `1:00 PM – 5:00 PM: Atc & Araneta Mall Linking`), which overrode the afternoon slots even though you only provided **1 repository path** (`{repo_path}`).\n\n\
+             ✅ **Autonomous Correction Applied:**\n\
+             • Removed the afternoon split (`Atc & Araneta Mall Linking`) from both `{}` and `{}`.\n\
+             • Unified your **entire 8-hour day (8:00 AM – 5:00 PM)** under `{title}` (`{repo_path}`).\n\
+             • Scanned the latest Git commit history of `{repo_path}` across all 8 hourly slots and regenerated your Word & Excel reports:\n{}\n\n\
+             {}",
+            rules::RULE_WORD,
+            rules::RULE_EXCEL,
+            files
+                .iter()
+                .map(|p| format!("• {}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            preview
+        ));
+    }
+
+    // Case B: User excludes a project title, specifies a single project/path for the report, or references the project "just mentioned"
+    let has_exclusion = !analysis.excluded_titles.is_empty();
+    let references_previous_project = lower.contains("just mentioned")
+        || lower.contains("project mentioned")
+        || lower.contains("mentioned only")
+        || lower.contains("since it's one")
+        || lower.contains("since its one")
+        || lower.contains("base your title on")
+        || lower.contains("only 1 project")
+        || lower.contains("only one project");
+    let has_single_focus_cue = lower.contains("just look at")
+        || lower.contains("only look at")
+        || lower.contains("scan all the git")
+        || lower.contains("git commit history")
+        || lower.contains("git history")
+        || lower.contains("this project")
+        || lower.contains("not include")
+        || lower.contains("don't include")
+        || lower.contains("still put")
+        || lower.contains("i don't want that")
+        || lower.contains("i dont want that");
+    let asks_clarification_policy = lower.contains("clarification") || lower.contains("unsure");
+
+    if !has_exclusion && !references_previous_project && !has_single_focus_cue {
+        return None;
+    }
+
+    // Determine the target single project (title, repo_path)
+    let resolved_target: Option<(String, String)> = if analysis.positive_projects.len() == 1 {
+        Some(analysis.positive_projects[0].clone())
+    } else if analysis.positive_projects.is_empty() && has_exclusion {
+        // If user excluded Atc & Araneta Mall Linking, unify on Enterprise Mall Linking (and vice versa)
+        if analysis
+            .excluded_titles
+            .iter()
+            .any(|t| t.to_lowercase().contains("atc"))
+        {
+            Some((
+                "Enterprise Mall Linking".to_string(),
+                r"C:\Users\MIS jap\source\repos\MallLinking".to_string(),
+            ))
+        } else if analysis
+            .excluded_titles
+            .iter()
+            .any(|t| t.to_lowercase().contains("enterprise"))
+        {
+            Some((
+                "Atc & Araneta Mall Linking".to_string(),
+                r"C:\Users\MIS jap\source\repos\Mall_Linking".to_string(),
+            ))
+        } else {
+            resolve_project_from_history(history, date)
+        }
+    } else if analysis.positive_projects.is_empty() && references_previous_project {
+        resolve_project_from_history(history, date)
+    } else {
+        None
+    };
+
+    let Some((title, repo_path)) = resolved_target else {
+        // Genuine ambiguity -> Ask the user for clarification!
+        let cfg = config::load();
+        let repos = senses::list_tracked_repos(&cfg.tracking.project_dirs);
+        let mut repo_options = String::new();
+        for r in &repos {
+            let suggested_title = if r.name.eq_ignore_ascii_case("MallLinking") {
+                "Enterprise Mall Linking"
+            } else if r.name.eq_ignore_ascii_case("Mall_Linking") {
+                "Atc & Araneta Mall Linking"
+            } else {
+                &r.name
+            };
+            repo_options += &format!(
+                "  • **`{suggested_title}`** — Path: `{}`\n",
+                r.path.display()
+            );
+        }
+        if repo_options.is_empty() {
+            repo_options = "  • **`Enterprise Mall Linking`** — Path: `C:\\Users\\MIS jap\\source\\repos\\MallLinking`\n  • **`Atc & Araneta Mall Linking`** — Path: `C:\\Users\\MIS jap\\source\\repos\\Mall_Linking`\n".to_string();
+        }
+        return Some(format!(
+            "❓ **Clarification Needed — Which Project Should Fill Your Full-Day Report?**\n\n\
+             I want to make sure I use the exact project title and Git repository you want across all 8 hours (8:00 AM – 5:00 PM) without guessing.\n\n\
+             Available monitored projects:\n\
+             {repo_options}\n\
+             Please reply with the project name or path you want me to use (for example: `Use Enterprise Mall Linking for the whole day`), and I will immediately scan its latest Git commits and generate your `.docx` and `.xlsx` reports!"
+        ));
+    };
+
+    // Unify both rules & memory under this single project
+    apply_single_project_to_rules_and_memory(&title, &repo_path, "Findings");
+    let _ = fs::remove_file(paths::digest_file(date));
+    rules::set_active_rules(
+        date,
+        &[rules::RULE_WORD.to_string(), rules::RULE_EXCEL.to_string()],
+    );
+
+    let recent_commits = senses::recent_commits_for_path(Path::new(&repo_path), 8);
+    let mut commit_log_summary = String::new();
+    if !recent_commits.is_empty() {
+        commit_log_summary += &format!(
+            "\n🔍 **Scanned Latest {} Git Commits in `{}`:**\n",
+            recent_commits.len(),
+            repo_path
+        );
+        for (idx, c) in recent_commits.iter().enumerate() {
+            commit_log_summary += &format!("  {}. `[{}] {}`\n", idx + 1, c.hash, c.subject);
+        }
+    }
+
+    let excluded_note = if !analysis.excluded_titles.is_empty() {
+        format!(
+            "• **Excluded Title(s)**: Removed `{}` from all afternoon and full-day slots.\n",
+            analysis.excluded_titles.join(", ")
+        )
+    } else {
+        String::new()
+    };
+
+    let clarification_note = if asks_clarification_policy {
+        "• **Clarification Policy Active**: Whenever a project path or title is not clear from your prompt or recent conversation, I will pause and ask you for clarification before generating.\n"
+    } else {
+        ""
+    };
+
+    let files = generate_rule_reports_with_mode(date, true).unwrap_or_default();
+    let preview = generate_full_day_table_preview(date);
+
+    Some(format!(
+        "✅ **Unified Full-Day Report (8:00 AM – 5:00 PM) Under Single Project: `{title}`**\n\
+         • **Target Repository**: `{repo_path}`\n\
+         • **Title Prefix (All 8 Hours)**: `{title} – ` in Column 3 (Findings)\n\
+         {}{}\
+         • **Updated Rules**: `{}` & `{}` synchronized autonomously.\n\
+         {}\n\
+         📄 **Generated Word (.docx) & Excel (.xlsx) Files:**\n{}\n\n\
+         {}",
+        excluded_note,
+        clarification_note,
+        rules::RULE_WORD,
+        rules::RULE_EXCEL,
+        commit_log_summary,
+        files
+            .iter()
+            .map(|p| format!("• {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        preview
+    ))
 }
 
 fn parse_and_save_rule_command(cmd: &str) -> String {
@@ -1590,5 +2052,39 @@ mod tests {
         assert!(text.contains("Atc & Araneta Mall Linking"));
         assert!(text.contains("8:00 AM – 9:00 AM"));
         assert!(text.contains("4:00 PM – 5:00 PM"));
+    }
+
+    #[test]
+    fn handles_single_project_exclusion_and_history_resolution() {
+        let today = Local::now().date_naive();
+
+        // 1. User excludes Atc & Araneta Mall Linking and commands to focus on Enterprise Mall Linking
+        let exclusion_prompt = "Take a look you still put this title Atc & Araneta Mall Linking –, I already Command you to not include that, Just look at the Enterprise Mall Linking Project, Scan all the Git Commit history and look for the Latest Commits to use to fill our Whole Day Report";
+        let reply = handle_conversational_rules(today, exclusion_prompt).expect("should handle exclusion");
+        assert!(reply.contains("Unified Full-Day Report (8:00 AM – 5:00 PM) Under Single Project: `Enterprise Mall Linking`"));
+        let table_part = reply.split("📋 **Full Day Work Report").nth(1).unwrap_or("");
+        assert!(table_part.contains("Enterprise Mall Linking –"));
+        assert!(!table_part.contains("Atc & Araneta Mall Linking –"));
+
+        // 2. User references project "just mentioned" in history
+        let history = vec![(
+            true,
+            "Access the Git History and Generate Report of What We Have done Today this Project C:\\Users\\MIS jap\\source\\repos\\MallLinking".to_string(),
+        )];
+        let hist_prompt = "I don't want that, Base your title on which Project just mentioned, Since it's one Make sure that you Fill my Whole Day with it, Plus if you are unsure and you need clarification make sure to ask";
+        let hist_reply = handle_conversational_rules_with_history(today, &history, hist_prompt)
+            .expect("should resolve from history");
+        assert!(hist_reply.contains("Enterprise Mall Linking"));
+        assert!(hist_reply.contains("Clarification Policy Active"));
+
+        // 3. When no project is in prompt or history, it asks for clarification
+        let _ = fs::remove_file(paths::chat_file(today));
+        let clarify_reply = handle_conversational_rules_with_history(
+            today,
+            &[],
+            "Base your title on which Project just mentioned, if you are unsure ask for clarification",
+        )
+        .expect("should ask for clarification");
+        assert!(clarify_reply.contains("Clarification Needed"));
     }
 }

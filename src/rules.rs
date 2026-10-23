@@ -130,6 +130,106 @@ impl RuleProfile {
         None
     }
 
+    /// Returns true if the rule uses a single unified project across the entire working day.
+    pub fn is_single_project_day(&self) -> bool {
+        if self.schedule_splits.len() <= 1 {
+            return true;
+        }
+        let first_title = self.schedule_splits[0].project_title.trim();
+        let first_repo = self.schedule_splits[0].repo_path.trim();
+        self.schedule_splits.iter().all(|s| {
+            s.project_title.trim().eq_ignore_ascii_case(first_title)
+                && s.repo_path.trim().eq_ignore_ascii_case(first_repo)
+        })
+    }
+
+    /// Configure this rule to focus 100% of the working day (8:00 AM – 5:00 PM) on a single project and repository,
+    /// removing any multi-project splits or secondary titles.
+    pub fn apply_single_project(&mut self, title: &str, repo_path: &str, target_col: &str) {
+        let clean_title = title.trim();
+        let clean_repo = repo_path.trim();
+        let col = if target_col.trim().is_empty() {
+            "Findings"
+        } else {
+            target_col.trim()
+        };
+
+        self.title_prefix = clean_title.to_string();
+        self.title_target_col = col.to_string();
+        self.schedule_splits = vec![ScheduleSplit {
+            start_hour: self.start_hour,
+            end_hour: self.end_hour,
+            project_title: clean_title.to_string(),
+            repo_path: clean_repo.to_string(),
+        }];
+
+        let repo_clause = if clean_repo.is_empty() {
+            format!("the {clean_title} codebase")
+        } else {
+            format!("{clean_title} ({clean_repo})")
+        };
+
+        if col.eq_ignore_ascii_case("Findings") {
+            self.instructions = format!(
+                "Follow this exact engineering report style for every hourly row:\n\
+                 - Column 1 (Time): Hourly range such as \"8:00 AM – 9:00 AM\" (skipping 12:00 PM – 1:00 PM lunch).\n\
+                 - Column 2 (Cause): Start with \"Need ...\" stating the architectural, security, operational, or business reason why this hour's work was needed.\n\
+                 - Column 3 (Findings): MUST start with the exact Work/Project Title prefix: \"{clean_title} – \" for EVERY SINGLE ROW across the entire day (8:00 AM – 5:00 PM), followed by concrete technical work completed from the latest Git commit history of {repo_clause}, naming specific classes, methods, services, and outcomes. Do NOT include any other project title.\n\
+                 - Clean out any irrelevant searches or distractions and attribute the full 8-hour day strictly to {clean_title}.\n\
+                 - For the final 4:00 PM – 5:00 PM slot (when triggered at 4:40 PM), synthesize and predict the final integration and end-to-end verification completing the afternoon's work on {clean_title}."
+            );
+        } else {
+            self.instructions = format!(
+                "Follow this exact engineering report style for every hourly row:\n\
+                 - Column 1 (Time): Hourly range such as \"8:00 AM – 9:00 AM\" (skipping 12:00 PM – 1:00 PM lunch).\n\
+                 - Column 2 (Cause): MUST start with the Work Title prefix: \"{clean_title} - Need ...\" for EVERY SINGLE ROW across the entire day (8:00 AM – 5:00 PM).\n\
+                 - Column 3 (Findings): Concrete technical work completed from the latest Git commit history of {repo_clause}, naming specific classes, methods, services, and outcomes.\n\
+                 - Clean out any irrelevant searches or distractions and attribute the full 8-hour day strictly to {clean_title}.\n\
+                 - For the final 4:00 PM – 5:00 PM slot (when triggered at 4:40 PM), synthesize and predict the final integration and end-to-end verification completing the afternoon's work on {clean_title}."
+            );
+        }
+    }
+
+    /// Configure this rule with a morning (8:00–12:00) and afternoon (13:00–17:00) project split.
+    pub fn apply_split_projects(
+        &mut self,
+        morning_title: &str,
+        morning_repo: &str,
+        afternoon_title: &str,
+        afternoon_repo: &str,
+    ) {
+        self.title_target_col = "Findings".into();
+        self.title_prefix = morning_title.trim().into();
+        self.schedule_splits = vec![
+            ScheduleSplit {
+                start_hour: 8,
+                end_hour: 12,
+                project_title: morning_title.trim().to_string(),
+                repo_path: morning_repo.trim().to_string(),
+            },
+            ScheduleSplit {
+                start_hour: 13,
+                end_hour: 17,
+                project_title: afternoon_title.trim().to_string(),
+                repo_path: afternoon_repo.trim().to_string(),
+            },
+        ];
+        self.instructions = format!(
+            "Follow this exact engineering report style for every hourly row:\n\
+             - Column 1 (Time): Hourly range such as \"8:00 AM – 9:00 AM\" (skipping 12:00 PM – 1:00 PM lunch).\n\
+             - Column 2 (Cause): Start with \"Need ...\" stating the architectural, security, operational, or business reason why this hour's work was needed.\n\
+             - Column 3 (Findings): MUST start with the assigned Work/Project Title prefix:\n\
+               • Hours 8:00 AM – 12:00 PM: Prefix with \"{} – \" naming specific classes, methods, and outcomes completed on {}.\n\
+               • Hours 1:00 PM – 5:00 PM: Prefix with \"{} – \" naming specific classes, methods, and outcomes completed on {}.\n\
+             - Clean out any irrelevant searches or distractions and attribute the full hour to the main project worked on.\n\
+             - For the final 4:00 PM – 5:00 PM slot (when triggered at 4:40 PM), synthesize and predict the final integration and end-to-end verification completing the afternoon's work.",
+            morning_title.trim(),
+            morning_repo.trim(),
+            afternoon_title.trim(),
+            afternoon_repo.trim()
+        );
+    }
+
     pub fn to_readable_txt(&self) -> String {
         let excl: Vec<String> = self.exclude_hours.iter().map(|h| format!("{h}:00")).collect();
         let mut splits_txt = String::new();
@@ -332,6 +432,40 @@ pub fn add_learned_note(note: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     writeln!(f, "[{}] {}", Local::now().format("%Y-%m-%d %H:%M"), cleaned)
         .map_err(|e| e.to_string())
+}
+
+/// Replace any outdated project/schedule/title rules in `memory/learned.txt` with the latest directive
+/// so old split or title configurations never conflict with the user's current instruction.
+pub fn set_project_schedule_memory(note: &str) -> Result<(), String> {
+    let cleaned = note.trim();
+    if cleaned.is_empty() {
+        return Ok(());
+    }
+    let path = paths::learned_file();
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let filtered: Vec<&str> = existing
+        .lines()
+        .filter(|line| {
+            let l = line.trim();
+            !l.is_empty()
+                && !l.contains("Multi-Project Schedule Configured")
+                && !l.contains("Single-Project Schedule Configured")
+                && !l.contains("Mandatory Work Title:")
+                && !l.starts_with("• 8:00 AM – 12:00 PM:")
+                && !l.starts_with("• 1:00 PM – 5:00 PM:")
+                && !l.starts_with("• 8:00 AM – 5:00 PM")
+                && !l.starts_with("• All reports saved in centralized")
+                && !l.starts_with("• Findings start with")
+        })
+        .collect();
+
+    let mut out = if filtered.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", filtered.join("\n"))
+    };
+    out.push_str(&format!("[{}] {}\n", Local::now().format("%Y-%m-%d %H:%M"), cleaned));
+    fs::write(&path, out).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

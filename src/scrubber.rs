@@ -164,32 +164,58 @@ pub fn clean_hour_slot_with_rule(
         }
     }
 
+    // Filter today's live commits to the assigned repository if one is explicitly configured
+    let filtered_commits: Vec<GitCommit> = if !assigned_repo.is_empty() {
+        let target_repo_name = std::path::Path::new(&assigned_repo)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        commits
+            .iter()
+            .filter(|c| target_repo_name.is_empty() || c.repo.eq_ignore_ascii_case(&target_repo_name))
+            .cloned()
+            .collect()
+    } else {
+        commits.to_vec()
+    };
+
     // Add read-only Git commits & filtered Clipboard/Typed senses for this hour
-    for item in senses::senses_for_hour(senses, commits, hour) {
+    for item in senses::senses_for_hour(senses, &filtered_commits, hour) {
         evidence.push(item);
     }
 
-    // If an assigned repo is configured and no commits were recorded for this hour today,
-    // pull recent commits from that repository to populate concrete evidence
+    // If an assigned repo is configured, pull recent commits (with commit body + touched files)
+    // from that repository to populate concrete evidence across all working hours
     if !assigned_repo.is_empty() {
         let p = std::path::Path::new(&assigned_repo);
         if p.exists() {
-            let repo_commits = senses::recent_commits_for_path(p, 6);
+            let repo_commits = senses::recent_commits_for_path(p, 10);
             if !repo_commits.is_empty() {
-                // Distribute commits across hours
-                let slot_idx = if hour >= 13 {
+                // When a single project covers the whole day (8:00 AM – 5:00 PM), distribute across all 8 working hours (0..8)
+                // so morning and afternoon hours each get distinct commits from the project's Git history.
+                let slot_idx = if rule.is_single_project_day() {
+                    let full_day_hours = [8u32, 9, 10, 11, 13, 14, 15, 16];
+                    full_day_hours.iter().position(|&h| h == hour).unwrap_or(0)
+                } else if hour >= 13 {
                     (hour.saturating_sub(13)) as usize
                 } else {
                     (hour.saturating_sub(8)) as usize
                 };
                 if let Some(c) = repo_commits.get(slot_idx % repo_commits.len()) {
-                    evidence.push(format!("Git commit ({}): {}", c.hash, c.subject));
+                    let commit_entry = if c.files_summary.is_empty() {
+                        format!("Git commit ({}): {}", c.hash, c.subject)
+                    } else {
+                        format!("Git commit ({}): {} ({})", c.hash, c.subject, c.files_summary)
+                    };
+                    if !evidence.iter().any(|e| e.contains(&c.hash)) {
+                        evidence.insert(0, commit_entry);
+                    }
                 }
             }
         }
     }
 
-    if primary_project.is_empty() || is_generic_app(&primary_project) {
+    if !assigned_title.is_empty() {
         primary_project = assigned_title.clone();
     }
 
@@ -200,17 +226,26 @@ pub fn clean_hour_slot_with_rule(
                 assigned_title
             ));
         } else {
-            let is_morning_split = hour < 12;
-            let milestone = if is_morning_split && (assigned_title.contains("Enterprise") || assigned_repo.contains("MallLinking")) {
+            let milestone = if assigned_title.contains("Enterprise")
+                || (assigned_repo.contains("MallLinking") && !assigned_repo.contains("Mall_Linking"))
+            {
                 match hour {
-                    8 => format!("Integrated live ingestion streaming on Tab 2, progress metrics, and ChangeTracker clearance to safeguard memory on {assigned_title}"),
-                    9 => format!("Implemented Tab 4 Database Table Inspector with column locking, in-memory RowFilter, and inline row editing on {assigned_title}"),
-                    10 => format!("Implemented Ayala Project Uno compliance, consolidated unmapped dialog, and line-level employee discount ingestion on {assigned_title}"),
-                    11 => format!("Refined VAT-exempt calculation logic, updated payment classifier rules, and implemented tray auto-lock on {assigned_title}"),
+                    8 => format!("Streamlined auto-ingest status with daily-scoped counts (_dailyIngestedCount) and ScheduleRevertToWatching() in InboundFolderMonitorService.cs on {assigned_title}"),
+                    9 => format!("Implemented chunked batching (MaxBatchFiles) with lazy Directory.EnumerateFiles in InboundFolderMonitorService.cs and fixed ExecuteSqlRawAsync in DbInitializer.cs on {assigned_title}"),
+                    10 => format!("Resolved XML drag-and-drop exclusion and aligned RockwellMallAdapter.cs export parity, HourlyExportWorker.cs, and EodBatchService.cs on {assigned_title}"),
+                    11 => format!("Refined statutory VAT-exempt calculations in PosXmlIngestionService.cs, CreditCard routing in PaymentClassifierService.cs, and tray auto-lock in MainWindow.xaml.cs on {assigned_title}"),
+                    13 => format!("Implemented Ayala Project Uno compliance in AyalaMallAdapter.cs, DiscountClassifierService.cs, MappingEngineService.cs, and PosRepository.cs on {assigned_title}"),
+                    14 => format!("Resolved FunctionLog date archiving, hardened Tab 4 security, added ScrollableListDialog.xaml.cs, and built streaming Excel exporter in StagingRepository.cs on {assigned_title}"),
+                    15 => format!("Integrated live ingestion streaming on Tab 2, progress metrics, ChangeTracker memory safeguards, and Tab 4 Database Table Inspector on {assigned_title}"),
+                    16 => format!("Completed EOD validation, straggler reconciliation in EodValidationService.cs, and end-to-end regression verification on {assigned_title}"),
                     _ => format!("Core architectural implementation, unit testing, and component turnover on {assigned_title}"),
                 }
             } else if assigned_title.contains("Atc") || assigned_title.contains("Araneta") || assigned_repo.contains("Mall_Linking") {
                 match hour {
+                    8 => format!("Application architecture review, named mutex single-instance control in Program.cs, and bootstrapping setup on {assigned_title}"),
+                    9 => format!("Startup pipeline reordering, license checker validation, and database initialization on {assigned_title}"),
+                    10 => format!("Codebase architectural turnover, operational workflows review, and service turnover on {assigned_title}"),
+                    11 => format!("Hands-on calculation logic walkthrough, core generation logic review, and technical clarifications on {assigned_title}"),
                     13 => format!("Implemented single-instance application control in Program.cs utilizing named mutex (AppMutexName) on {assigned_title}"),
                     14 => format!("Hardened password security with static PasswordService implementing PBKDF2 hashing and timing-attack mitigation on {assigned_title}"),
                     15 => format!("Stabilized multi-format flow, config gating, and added Araneta City LSMS multi-format support alongside ATC CSV on {assigned_title}"),

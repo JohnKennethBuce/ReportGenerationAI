@@ -14,6 +14,12 @@ static ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn root() -> &'static PathBuf {
     ROOT.get_or_init(|| {
+        if cfg!(test) {
+            let test_root = std::env::temp_dir().join("DayRecapTestEnv");
+            let _ = fs::create_dir_all(&test_root);
+            return test_root;
+        }
+
         let portable = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
