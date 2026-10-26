@@ -132,6 +132,25 @@ pub fn clean_hour_slot_with_rule(
     let mut evidence = Vec::new();
     let mut primary_project = String::new();
 
+    // If the user explicitly provided a structured work summary for today (`[USER_CAUSE]` / `[USER_WORK]`),
+    // honor it across subsequent report runs unless cleared.
+    if let Ok(existing_digests) = fs::read_to_string(paths::digest_file(day.date)) {
+        let prefix = format!("{:02}\t", hour);
+        if let Some(line) = existing_digests.lines().find(|l| l.starts_with(&prefix)) {
+            if line.contains("[USER_CAUSE]") && line.contains("[USER_WORK]") {
+                let parts: Vec<&str> = line.splitn(4, '\t').collect();
+                if let Some(&ev_part) = parts.get(3) {
+                    for seg in ev_part.split(" ; ") {
+                        let s = seg.trim();
+                        if !s.is_empty() {
+                            evidence.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(h) = hour_data {
         let relevant_apps: Vec<&AppUse> = h
             .apps
@@ -386,7 +405,7 @@ pub fn save_hourly_digest(date: NaiveDate, slot: &CleanedHourSlot) {
             slot.hour,
             slot.time_label,
             slot.primary_project.replace(['\t', '\r', '\n'], " "),
-            truncate(&joined, 500)
+            truncate(&joined, 1200)
         );
     }
 }

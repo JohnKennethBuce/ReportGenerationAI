@@ -19,7 +19,31 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
+
+static LAST_GENERATED_ROWS: OnceLock<Mutex<Option<(NaiveDate, Vec<ReportRow>)>>> = OnceLock::new();
+
+fn rows_cache_lock() -> &'static Mutex<Option<(NaiveDate, Vec<ReportRow>)>> {
+    LAST_GENERATED_ROWS.get_or_init(|| Mutex::new(None))
+}
+
+fn cache_generated_rows(date: NaiveDate, rows: &[ReportRow]) {
+    if let Ok(mut guard) = rows_cache_lock().lock() {
+        *guard = Some((date, rows.to_vec()));
+    }
+}
+
+fn get_cached_rows(date: NaiveDate) -> Option<Vec<ReportRow>> {
+    if let Ok(guard) = rows_cache_lock().lock() {
+        if let Some((d, ref rows)) = *guard {
+            if d == date && !rows.is_empty() {
+                return Some(rows.clone());
+            }
+        }
+    }
+    None
+}
 
 const RULE: &str = "============================================================";
 
@@ -40,19 +64,43 @@ fn long_date(date: NaiveDate) -> String {
 
 /// Generate reports for all rules currently active on `date` (e.g. `workReportFormatword` + `ExcelReportFormatExcel`).
 pub fn generate_rule_reports(date: NaiveDate) -> Result<Vec<PathBuf>, String> {
+    if let Ok(raw_chat) = fs::read_to_string(paths::chat_file(date)) {
+        if let Some(idx) = raw_chat.rfind("] You:") {
+            let after_you = &raw_chat[idx + 6..];
+            let user_msg = after_you.split("\n[").next().unwrap_or(after_you).trim();
+            if let Some(_reply) = handle_user_provided_work_summary(date, user_msg) {
+                return Ok(rules::active_profiles(date)
+                    .iter()
+                    .map(|p| paths::reports_dir().join(office::resolve_filename(&p.filename_pattern, date, &p.format)))
+                    .collect());
+            }
+        }
+    }
     generate_rule_reports_with_mode(date, false)
 }
 
 /// Generate reports for all rules currently active on `date`, with optional full-day override.
+/// Computes the hourly rows once and shares them across matching `.docx` and `.xlsx` profiles for instant generation.
 pub fn generate_rule_reports_with_mode(date: NaiveDate, force_full_day: bool) -> Result<Vec<PathBuf>, String> {
     rules::ensure_defaults();
     let profiles = rules::active_profiles(date);
     let mut generated = Vec::new();
     let mut errors = Vec::new();
+    let mut shared_rows: Option<Vec<ReportRow>> = None;
 
     for profile in &profiles {
-        match generate_single_rule_report_with_mode(date, profile, force_full_day) {
-            Ok(path) => generated.push(path),
+        match generate_single_rule_report_with_shared_rows(
+            date,
+            profile,
+            force_full_day,
+            shared_rows.as_deref(),
+        ) {
+            Ok((path, rows)) => {
+                if shared_rows.is_none() {
+                    shared_rows = Some(rows);
+                }
+                generated.push(path);
+            }
             Err(e) => errors.push(format!("{}: {e}", profile.name)),
         }
     }
@@ -77,24 +125,20 @@ pub fn generate_single_rule_report_with_mode(
     rule: &RuleProfile,
     force_full_day: bool,
 ) -> Result<PathBuf, String> {
-    let cfg = config::load();
-    let day = load_summary(date);
-    let all_senses = if rule.use_typed_and_copied {
-        senses::load_senses(date)
-    } else {
-        Vec::new()
-    };
-    let commits = if rule.use_git_commits && cfg.tracking.enable_git_sense {
-        senses::read_git_commits(date, &cfg.tracking.project_dirs)
-    } else {
-        Vec::new()
-    };
+    generate_single_rule_report_with_shared_rows(date, rule, force_full_day, None).map(|(p, _)| p)
+}
 
+fn generate_single_rule_report_with_shared_rows(
+    date: NaiveDate,
+    rule: &RuleProfile,
+    force_full_day: bool,
+    precomputed_rows: Option<&[ReportRow]>,
+) -> Result<(PathBuf, Vec<ReportRow>), String> {
+    let cfg = config::load();
     let now = Local::now();
     let (now_h, now_m) = if date == now.date_naive() {
         (now.hour(), now.minute())
     } else {
-        // Past dates always generate the full schedule
         (rule.end_hour, 0)
     };
 
@@ -107,17 +151,45 @@ pub fn generate_single_rule_report_with_mode(
         force_full_day,
     );
 
-    let mut slots = Vec::with_capacity(hours.len());
-    for &h in &hours {
-        let is_predicted_tail = is_full_day && rule.predict_tail && Some(&h) == hours.last();
-        let slot = scrubber::clean_hour_slot_with_rule(h, &day, &all_senses, &commits, is_predicted_tail, rule);
-        if date < now.date_naive() || h < now_h {
-            scrubber::save_hourly_digest(date, &slot);
-        }
-        slots.push(slot);
-    }
+    let rows = if let Some(existing) = precomputed_rows {
+        existing.to_vec()
+    } else {
+        let day = load_summary(date);
+        let all_senses = if rule.use_typed_and_copied {
+            senses::load_senses(date)
+        } else {
+            Vec::new()
+        };
+        let commits = if rule.use_git_commits && cfg.tracking.enable_git_sense {
+            senses::read_git_commits(date, &cfg.tracking.project_dirs)
+        } else {
+            Vec::new()
+        };
 
-    let rows = build_rule_rows(&cfg, rule, &slots);
+        let mut slots = Vec::with_capacity(hours.len());
+        for &h in &hours {
+            let is_predicted_tail = is_full_day && rule.predict_tail && Some(&h) == hours.last();
+            let slot = scrubber::clean_hour_slot_with_rule(h, &day, &all_senses, &commits, is_predicted_tail, rule);
+            if date < now.date_naive() || h < now_h {
+                scrubber::save_hourly_digest(date, &slot);
+            }
+            slots.push(slot);
+        }
+
+        let computed = build_rule_rows(&cfg, rule, &slots);
+        cache_generated_rows(date, &computed);
+        computed
+    };
+
+    write_rule_report_file(date, rule, is_full_day, &rows).map(|p| (p, rows))
+}
+
+fn write_rule_report_file(
+    date: NaiveDate,
+    rule: &RuleProfile,
+    is_full_day: bool,
+    rows: &[ReportRow],
+) -> Result<PathBuf, String> {
     let file_name = office::resolve_filename(&rule.filename_pattern, date, &rule.format);
     let out_path = paths::reports_dir().join(file_name);
 
@@ -136,16 +208,16 @@ pub fn generate_single_rule_report_with_mode(
 
     match rule.format.to_lowercase().as_str() {
         "docx" | "word" => {
-            office::write_docx(&out_path, &rule.name, &subtitle, &rule.columns, &rows)?;
+            office::write_docx(&out_path, &rule.name, &subtitle, &rule.columns, rows)?;
         }
         "xlsx" | "excel" => {
-            office::write_xlsx(&out_path, &rule.name, &rule.columns, &rows)?;
+            office::write_xlsx(&out_path, &rule.name, &rule.columns, rows)?;
         }
         _ => {
             let mut txt = format!("{}\n{}\n{RULE}\n", rule.name, subtitle);
             txt += &rule.columns.join(" | ");
             txt += "\n";
-            for r in &rows {
+            for r in rows {
                 txt += &r.cols.join(" | ");
                 txt += "\n";
             }
@@ -157,6 +229,27 @@ pub fn generate_single_rule_report_with_mode(
 }
 
 fn build_rule_rows(cfg: &Config, rule: &RuleProfile, slots: &[CleanedHourSlot]) -> Vec<ReportRow> {
+    // Fast-path (< 1ms): When slots already contain rich structured Git commit history
+    // or user-provided structured work notes, synthesize deterministically without waiting
+    // 30-90 seconds for a remote reasoning LLM.
+    let rich_structured_slots = slots
+        .iter()
+        .filter(|s| {
+            s.work_evidence.iter().any(|ev| {
+                ev.starts_with("Git commit (")
+                    || ev.starts_with("Git commit [")
+                    || ev.starts_with("[USER_WORK]")
+            })
+        })
+        .count();
+
+    if rich_structured_slots * 2 >= slots.len().max(1) {
+        return slots
+            .iter()
+            .map(|slot| synthesize_fallback_row(rule, slot, &rule.columns))
+            .collect();
+    }
+
     if let Ok(Some(ep)) = llm::resolve(&cfg.ai) {
         if let Some(ai_rows) = try_ai_rule_rows(&ep, cfg, rule, slots) {
             return ai_rows;
@@ -414,9 +507,19 @@ fn synthesize_fallback_row(rule: &RuleProfile, slot: &CleanedHourSlot, columns: 
 
 fn derive_cause_from_slot(slot: &CleanedHourSlot) -> String {
     for ev in &slot.work_evidence {
+        if let Some(rest) = ev.strip_prefix("[USER_CAUSE] ") {
+            return enforce_clean_cause(rest);
+        }
         if let Some(idx) = ev.find("): ") {
             let after = &ev[idx + 3..];
-            let base = after.split(" — ").next().unwrap_or(after).split(" (Files:").next().unwrap_or(after).trim();
+            let base = after
+                .split(" — ")
+                .next()
+                .unwrap_or(after)
+                .split(" (Files:")
+                .next()
+                .unwrap_or(after)
+                .trim();
             // Strip conventional commit prefix like `feat(monitor): ` or `perf: ` or `fix(ingestion): `
             let summary = if let Some(c_idx) = base.find(": ") {
                 if c_idx <= 30 {
@@ -428,7 +531,9 @@ fn derive_cause_from_slot(slot: &CleanedHourSlot) -> String {
                 base
             };
             if !summary.is_empty() {
-                return format!("Need to {summary} to ensure reliable system performance, data integrity, and compliance.");
+                return format!(
+                    "Need to {summary} to ensure reliable system performance, data integrity, and operational compliance."
+                );
             }
         }
     }
@@ -436,6 +541,51 @@ fn derive_cause_from_slot(slot: &CleanedHourSlot) -> String {
         "Need final configuration integration, edge-case handling, and end-to-end verification across entry points.".into()
     } else {
         "Need focused engineering analysis, implementation, and workflow progression.".into()
+    }
+}
+
+fn format_findings_from_slot(slot: &CleanedHourSlot, proj: &str) -> String {
+    // 1. If user-provided structured work findings exist for this slot, use them directly
+    for ev in &slot.work_evidence {
+        if let Some(rest) = ev.strip_prefix("[USER_WORK] ") {
+            return rest.trim().to_string();
+        }
+    }
+
+    // 2. If a rich Git commit entry exists for this slot, format it into clean engineering prose
+    for ev in &slot.work_evidence {
+        if ev.starts_with("Git commit (") || ev.starts_with("Git commit [") {
+            if let Some(idx) = ev.find("): ") {
+                let after = ev[idx + 3..].trim();
+                let clean_body = if let Some(c_idx) = after.find(": ") {
+                    if c_idx <= 30 {
+                        after[c_idx + 2..].trim()
+                    } else {
+                        after
+                    }
+                } else {
+                    after
+                };
+                let mut chars = clean_body.chars();
+                let capitalized = match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => clean_body.to_string(),
+                };
+                let trimmed = capitalized.trim_end_matches('.');
+                return format!("{trimmed}.");
+            }
+        }
+    }
+
+    let joined = slot.work_evidence.join("; ");
+    if slot.is_predicted_tail {
+        format!(
+            "Integrated afternoon changes into {proj}, refined error handling and state management, and verified end-to-end behavior ({joined})."
+        )
+    } else if !slot.work_evidence.is_empty() {
+        format!("{joined}.")
+    } else {
+        format!("Completed engineering implementations and verified workflows on {proj}.")
     }
 }
 
@@ -471,16 +621,7 @@ fn fallback_col_value(rule: &RuleProfile, slot: &CleanedHourSlot, col_idx: usize
         }
         2 => {
             // Findings / Work Done
-            let joined = slot.work_evidence.join("; ");
-            let findings_body = if slot.is_predicted_tail {
-                format!(
-                    "Integrated afternoon changes into {proj}, refined error handling and state management, and verified end-to-end behavior ({joined})."
-                )
-            } else if !slot.work_evidence.is_empty() {
-                format!("{joined}.")
-            } else {
-                format!("Completed engineering implementations and verified workflows on {proj}.")
-            };
+            let findings_body = format_findings_from_slot(slot, proj);
 
             if is_findings_target {
                 enforce_findings_title_prefix(&findings_body, slot_title, proj)
@@ -982,6 +1123,11 @@ fn handle_conversational_rules_with_history(
         }
     }
 
+    // 5.4 Autonomous Ingestion of User-Provided Work Summary / Project Documentation ("here's What I done today ...")
+    if let Some(work_summary_reply) = handle_user_provided_work_summary(date, q_trim) {
+        return Some(work_summary_reply);
+    }
+
     // 5.5 Autonomous Self-Modifying Adaptation: Schedule Project Splits (e.g. 8-12 Enterprise Mall Linking, 1-5 Atc & Araneta Mall Linking)
     let is_split_instruction = (lower.contains("8-12") || lower.contains("8:00") || lower.contains("morning"))
         && (lower.contains("1-5") || lower.contains("afternoon") || lower.contains("1:00"))
@@ -1106,7 +1252,12 @@ fn handle_conversational_rules_with_history(
             || lower.contains("make our report")
             || lower.contains("generate report");
         if force_full {
-            let _ = fs::remove_file(paths::digest_file(date));
+            let has_user_summary = fs::read_to_string(paths::digest_file(date))
+                .map(|s| s.contains("[USER_CAUSE]"))
+                .unwrap_or(false);
+            if !has_user_summary {
+                let _ = fs::remove_file(paths::digest_file(date));
+            }
         }
         rules::set_active_rules(
             date,
@@ -1135,10 +1286,13 @@ fn handle_conversational_rules_with_history(
     }
 
     // 6. Autonomous Self-Modifying Adaptation: Move Title to Findings (or Cause)
-    let is_move_to_cause = (lower.contains("title") || lower.contains("work title"))
+    let is_short_rule_cmd = q_trim.len() < 260 && q_trim.lines().count() <= 4;
+    let is_move_to_cause = is_short_rule_cmd
+        && (lower.contains("title") || lower.contains("work title"))
         && (lower.contains("to cause") || lower.contains("in cause") || lower.contains("on cause"));
 
-    let is_title_instruction = !is_split_instruction
+    let is_title_instruction = is_short_rule_cmd
+        && !is_split_instruction
         && (lower.contains("title") || lower.contains("work title") || lower.contains("project title"))
         && (lower.contains("finding")
             || lower.contains("word workdone")
@@ -1147,7 +1301,8 @@ fn handle_conversational_rules_with_history(
             || lower.contains("reflect to the run")
             || lower.contains("haven't moved")
             || lower.contains("move")
-            || lower.contains("add ")
+            || lower.contains("add title")
+            || lower.contains("add the title")
             || lower.contains("each row")
             || lower.contains("every row")
             || lower.contains("rows of report")
@@ -1911,7 +2066,413 @@ fn extract_windows_path(text: &str) -> Option<String> {
     extract_all_windows_paths(text).into_iter().next()
 }
 
+#[derive(Debug, Default)]
+struct ParsedProjectBlock {
+    explicit_title: String,
+    inferred_title: String,
+    items: Vec<(String, String)>,
+}
+
+impl ParsedProjectBlock {
+    fn title(&self) -> String {
+        if !self.explicit_title.trim().is_empty() {
+            self.explicit_title.trim().to_string()
+        } else if !self.inferred_title.trim().is_empty() {
+            self.inferred_title.trim().to_string()
+        } else {
+            "Primary Project".to_string()
+        }
+    }
+}
+
+fn extract_project_title_from_sentence(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("The ").or_else(|| trimmed.strip_prefix("the ")) {
+        if let Some(is_idx) = rest.find(" is a ").or_else(|| rest.find(" is an ")) {
+            let candidate = rest[..is_idx].trim();
+            if !candidate.is_empty() && candidate.len() <= 55 && candidate.split_whitespace().count() <= 6 {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn is_numbered_section_heading(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let mut parts = trimmed.splitn(2, ". ");
+    let first = parts.next()?;
+    let second = parts.next()?;
+    if first.len() <= 2 && first.chars().all(|c| c.is_ascii_digit()) && second.len() <= 60 && !second.contains(". ") {
+        Some(second.trim().trim_end_matches(':').to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_user_work_blocks(text: &str) -> Vec<ParsedProjectBlock> {
+    let mut blocks: Vec<ParsedProjectBlock> = Vec::new();
+    let mut cur_block = ParsedProjectBlock::default();
+    let mut current_section = String::from("Overview");
+    let mut pending_topic: Option<String> = None;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let low = line.to_lowercase();
+
+        // Skip conversational intro line
+        if low.starts_with("here's what i done")
+            || low.starts_with("here's what i did")
+            || low.starts_with("here is what i done")
+            || low.starts_with("here is what i did")
+            || low.starts_with("what i done today")
+            || low.starts_with("today i worked on")
+            || low.starts_with("here is my work")
+            || low.starts_with("here's my work")
+        {
+            continue;
+        }
+
+        // Check if this line starts a new Project Block (e.g. "Documentation Summary Report 2: Queue Busting Application")
+        let is_new_report_header = low.starts_with("documentation summary report")
+            || low.starts_with("project 2:")
+            || low.starts_with("report 2:")
+            || low.starts_with("application 2:");
+
+        if is_new_report_header {
+            pending_topic = None;
+            if !cur_block.items.is_empty() {
+                blocks.push(cur_block);
+                cur_block = ParsedProjectBlock::default();
+            }
+            if let Some((_, after)) = line.split_once(':') {
+                let t = after.trim();
+                if !t.is_empty() {
+                    cur_block.explicit_title = t.to_string();
+                }
+            }
+            continue;
+        }
+
+        // Check numbered section heading like "1. Executive Overview"
+        if let Some(sec_name) = is_numbered_section_heading(line) {
+            pending_topic = None;
+            if sec_name.eq_ignore_ascii_case("Executive Overview") && cur_block.items.len() >= 3 {
+                blocks.push(cur_block);
+                cur_block = ParsedProjectBlock::default();
+            }
+            current_section = sec_name;
+            continue;
+        }
+
+        if cur_block.inferred_title.is_empty() {
+            if let Some(inferred) = extract_project_title_from_sentence(line) {
+                cur_block.inferred_title = inferred;
+            }
+        }
+
+        // Check if line ends with ':' (a sub-heading whose bullets follow on subsequent lines)
+        if line.ends_with(':') && line.len() <= 55 {
+            pending_topic = Some(line.trim_end_matches(':').trim().to_string());
+            continue;
+        }
+
+        // Check if line is "Topic: Detail"
+        if let Some((left, right)) = line.split_once(':') {
+            let left_trim = left.trim();
+            let right_trim = right.trim();
+            if left_trim.len() <= 45 && !right_trim.is_empty() && !left_trim.contains("http") {
+                pending_topic = None;
+                cur_block
+                    .items
+                    .push((left_trim.to_string(), right_trim.to_string()));
+                continue;
+            }
+        }
+
+        // Plain line: attach to `pending_topic` if active, otherwise add under `current_section`
+        if let Some(ref topic) = pending_topic {
+            if let Some(last) = cur_block.items.last_mut() {
+                if last.0 == *topic {
+                    if !last.1.ends_with('.') && !last.1.ends_with(';') {
+                        last.1.push_str("; ");
+                    } else {
+                        last.1.push(' ');
+                    }
+                    last.1.push_str(line);
+                    continue;
+                }
+            }
+            cur_block.items.push((topic.clone(), line.to_string()));
+        } else {
+            cur_block
+                .items
+                .push((current_section.clone(), line.to_string()));
+        }
+    }
+
+    if !cur_block.items.is_empty() {
+        blocks.push(cur_block);
+    }
+
+    blocks
+}
+
+fn synthesize_slot_from_work_items(
+    project_title: &str,
+    chunk: &[(String, String)],
+    slot_idx_in_block: usize,
+) -> (String, String) {
+    if chunk.is_empty() {
+        return (
+            format!("Need continuous engineering verification and integration for {project_title}."),
+            format!("{project_title} – Completed system verification and operational workflow testing."),
+        );
+    }
+
+    // 1. Build Cause ("Need ...")
+    let has_overview = chunk
+        .iter()
+        .any(|(t, _)| t.eq_ignore_ascii_case("Executive Overview") || t.eq_ignore_ascii_case("Overview"));
+
+    let mut topics: Vec<String> = Vec::new();
+    for (t, _) in chunk {
+        if !t.eq_ignore_ascii_case("Executive Overview")
+            && !t.eq_ignore_ascii_case("Overview")
+            && !topics.iter().any(|existing| existing.eq_ignore_ascii_case(t))
+        {
+            topics.push(t.clone());
+        }
+    }
+
+    let cause = if has_overview {
+        let overview_text = chunk
+            .iter()
+            .find(|(t, _)| t.eq_ignore_ascii_case("Executive Overview") || t.eq_ignore_ascii_case("Overview"))
+            .map(|(_, d)| d.as_str())
+            .unwrap_or("");
+        // Extract first sentence or purpose from overview
+        let first_sent = overview_text.split(". ").next().unwrap_or(overview_text).trim_end_matches('.');
+        if let Some(is_a_idx) = first_sent.find(" is a ").or_else(|| first_sent.find(" is an ")) {
+            let desc = first_sent[is_a_idx + 6..].trim();
+            if topics.is_empty() {
+                format!("Need a {desc} to deliver high-speed, reliable offline operation.")
+            } else {
+                format!(
+                    "Need a {desc} paired with {} for resilient, zero-bottleneck operation.",
+                    topics.join(" and ")
+                )
+            }
+        } else {
+            format!("Need to architect {project_title} core overview and foundational modules ({first_sent}).")
+        }
+    } else if !topics.is_empty() {
+        let joined_topics = if topics.len() == 1 {
+            topics[0].clone()
+        } else if topics.len() == 2 {
+            format!("{} and {}", topics[0], topics[1])
+        } else {
+            let last = topics.last().unwrap();
+            let head = &topics[..topics.len() - 1];
+            format!("{}, and {last}", head.join(", "))
+        };
+        match slot_idx_in_block {
+            1 => format!("Need to engineer {joined_topics} for high-reliability performance, zero downtime, and hardware optimization."),
+            2 => format!("Need streamlined {joined_topics} workflows to ensure seamless configuration, data synchronization, and persistence."),
+            _ => format!("Need end-to-end {joined_topics} integration and validation prior to production deployment."),
+        }
+    } else {
+        format!("Need to implement and verify core functional modules for {project_title}.")
+    };
+
+    // 2. Build Findings ("<Project Title> – ...")
+    let mut parts: Vec<String> = Vec::new();
+    for (topic, detail) in chunk {
+        let clean_detail = detail.trim().trim_end_matches('.');
+        if topic.eq_ignore_ascii_case("Executive Overview") || topic.eq_ignore_ascii_case("Overview") {
+            parts.push(format!("{clean_detail}."));
+        } else {
+            parts.push(format!("{topic}: {clean_detail}."));
+        }
+    }
+    let body = parts.join(" ");
+    let findings = enforce_findings_title_prefix(&body, project_title, project_title);
+
+    (enforce_clean_cause(&cause), findings)
+}
+
+fn handle_user_provided_work_summary(date: NaiveDate, q_trim: &str) -> Option<String> {
+    let lower = q_trim.to_lowercase();
+    let has_work_intro = lower.contains("here's what i done today")
+        || lower.contains("here's what i did today")
+        || lower.contains("here is what i done today")
+        || lower.contains("here is what i did today")
+        || lower.contains("what i done today")
+        || lower.contains("what i have done today")
+        || lower.contains("today i worked on")
+        || lower.contains("here is my work today")
+        || lower.contains("here's my work today");
+
+    let is_structured_doc_paste = q_trim.lines().count() >= 8
+        && (lower.contains("executive overview")
+            || lower.contains("key features & architecture")
+            || lower.contains("operational workflow")
+            || lower.contains("documentation summary report"));
+
+    if !has_work_intro && !is_structured_doc_paste {
+        return None;
+    }
+    if q_trim.lines().count() < 3 && q_trim.len() < 120 {
+        return None;
+    }
+
+    let blocks = parse_user_work_blocks(q_trim);
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let time_labels = [
+        "8:00 AM – 9:00 AM",
+        "9:00 AM – 10:00 AM",
+        "10:00 AM – 11:00 AM",
+        "11:00 AM – 12:00 PM",
+        "1:00 PM – 2:00 PM",
+        "2:00 PM – 3:00 PM",
+        "3:00 PM – 4:00 PM",
+        "4:00 PM – 5:00 PM",
+    ];
+    let hours_num = [8u32, 9, 10, 11, 13, 14, 15, 16];
+
+    let mut rows: Vec<ReportRow> = Vec::with_capacity(8);
+    let schedule_summary: String;
+    let _ = fs::remove_file(paths::digest_file(date));
+
+    if blocks.len() >= 2 {
+        // Morning (4 slots: 8-12) -> Block 0, Afternoon (4 slots: 1-5) -> Block 1
+        let morning_block = &blocks[0];
+        let afternoon_block = &blocks[1];
+        let m_title = morning_block.title();
+        let a_title = afternoon_block.title();
+
+        if let Some(mut w_rule) = rules::load_rule(rules::RULE_WORD) {
+            w_rule.apply_split_projects(&m_title, "", &a_title, "");
+            let _ = rules::save_rule(&w_rule);
+        }
+        if let Some(mut e_rule) = rules::load_rule(rules::RULE_EXCEL) {
+            e_rule.apply_split_projects(&m_title, "", &a_title, "");
+            let _ = rules::save_rule(&e_rule);
+        }
+        let _ = rules::set_project_schedule_memory(&format!(
+            "Multi-Project Work Summary Configured:\n• 8:00 AM – 12:00 PM: Title \"{m_title}\"\n• 1:00 PM – 5:00 PM: Title \"{a_title}\""
+        ));
+
+        schedule_summary = format!(
+            "• **Morning (8:00 AM – 12:00 PM)**: `{m_title}`\n• **Afternoon (1:00 PM – 5:00 PM)**: `{a_title}`"
+        );
+
+        for (block_idx, block) in [morning_block, afternoon_block].iter().enumerate() {
+            let b_title = block.title();
+            let n = block.items.len();
+            for s in 0..4 {
+                let start = (s * n) / 4;
+                let end = (((s + 1) * n) / 4).max(start + 1).min(n);
+                let chunk = if start < n { &block.items[start..end] } else { &[] };
+                let (cause, findings) = synthesize_slot_from_work_items(&b_title, chunk, s);
+                let slot_global = block_idx * 4 + s;
+                rows.push(ReportRow {
+                    cols: vec![time_labels[slot_global].to_string(), cause.clone(), findings.clone()],
+                });
+                let digest_slot = CleanedHourSlot {
+                    hour: hours_num[slot_global],
+                    time_label: time_labels[slot_global].to_string(),
+                    primary_project: b_title.clone(),
+                    assigned_title: b_title.clone(),
+                    assigned_repo: String::new(),
+                    work_evidence: vec![format!("[USER_CAUSE] {cause}"), format!("[USER_WORK] {findings}")],
+                    is_predicted_tail: slot_global == 7,
+                };
+                scrubber::save_hourly_digest(date, &digest_slot);
+            }
+        }
+    } else {
+        // Single project across all 8 hours (8:00 AM – 5:00 PM)
+        let block = &blocks[0];
+        let p_title = block.title();
+        apply_single_project_to_rules_and_memory(&p_title, "", "Findings");
+        schedule_summary = format!("• **Full Day (8:00 AM – 5:00 PM)**: `{p_title}`");
+
+        let n = block.items.len();
+        for s in 0..8 {
+            let start = (s * n) / 8;
+            let end = (((s + 1) * n) / 8).max(start + 1).min(n);
+            let chunk = if start < n { &block.items[start..end] } else { &[] };
+            let (cause, findings) = synthesize_slot_from_work_items(&p_title, chunk, s / 2);
+            rows.push(ReportRow {
+                cols: vec![time_labels[s].to_string(), cause.clone(), findings.clone()],
+            });
+            let digest_slot = CleanedHourSlot {
+                hour: hours_num[s],
+                time_label: time_labels[s].to_string(),
+                primary_project: p_title.clone(),
+                assigned_title: p_title.clone(),
+                assigned_repo: String::new(),
+                work_evidence: vec![format!("[USER_CAUSE] {cause}"), format!("[USER_WORK] {findings}")],
+                is_predicted_tail: s == 7,
+            };
+            scrubber::save_hourly_digest(date, &digest_slot);
+        }
+    }
+
+    cache_generated_rows(date, &rows);
+    rules::set_active_rules(
+        date,
+        &[rules::RULE_WORD.to_string(), rules::RULE_EXCEL.to_string()],
+    );
+
+    let mut generated_files = Vec::new();
+    for profile in rules::active_profiles(date) {
+        if let Ok(path) = write_rule_report_file(date, &profile, true, &rows) {
+            generated_files.push(path);
+        }
+    }
+
+    let preview = generate_full_day_table_preview(date);
+    Some(format!(
+        "✅ **Captured Your Work Summary & Generated Full-Day Reports Instantly!**\n\
+         {}\n\
+         • **Column 2 (Cause)**: Synthesized architectural & operational `Need ...` for each hour.\n\
+         • **Column 3 (Findings)**: Mapped your exact features, workflows, and architecture across all 8 hourly slots.\n\n\
+         📄 **Generated Word (.docx) & Excel (.xlsx) Files:**\n{}\n\n\
+         {}",
+        schedule_summary,
+        generated_files
+            .iter()
+            .map(|p| format!("• {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        preview
+    ))
+}
+
 fn generate_full_day_table_preview(date: NaiveDate) -> String {
+    if let Some(cached) = get_cached_rows(date) {
+        if cached.len() >= 8 {
+            let mut out = String::from(
+                "📋 **Full Day Work Report (8:00 AM – 5:00 PM)**\n\n| Time | Cause | Findings |\n|---|---|---|\n",
+            );
+            for r in &cached {
+                let t = r.cols.first().map(|s| s.as_str()).unwrap_or("");
+                let c = r.cols.get(1).map(|s| s.as_str()).unwrap_or("");
+                let f = r.cols.get(2).map(|s| s.as_str()).unwrap_or("");
+                out += &format!("| {t} | {c} | {f} |\n");
+            }
+            return out;
+        }
+    }
+
     let cfg = config::load();
     let day = load_summary(date);
     let all_senses = senses::load_senses(date);
@@ -1931,6 +2492,7 @@ fn generate_full_day_table_preview(date: NaiveDate) -> String {
     }
 
     let rows = build_rule_rows(&cfg, &word_rule, &slots);
+    cache_generated_rows(date, &rows);
 
     let mut out = String::from("📋 **Full Day Work Report (8:00 AM – 5:00 PM)**\n\n| Time | Cause | Findings |\n|---|---|---|\n");
     for (i, s) in slots.iter().enumerate() {
@@ -2086,5 +2648,78 @@ mod tests {
         )
         .expect("should ask for clarification");
         assert!(clarify_reply.contains("Clarification Needed"));
+    }
+
+    #[test]
+    fn handles_user_provided_work_summary_instantly() {
+        let today = Local::now().date_naive();
+        let prompt = r#"here's What I done today 
+
+1. Executive Overview
+The PriceVerifier Application is a high-performance, kiosk-style price verification system designed for retail environments. It allows customers to scan barcodes to instantly check product prices, view promotional badges, and hear audio feedback. The application boasts a lightweight footprint (<45 MB) and high-speed processing (27K records/sec) while operating 100% offline by generating a local mirror of the store’s database.
+
+2. Key Features & Architecture
+Multi-DB Engine: Supports SQLite, MariaDB, Postgres, and Cloud databases. Features auto schema detection, a hybrid 3-layer fast architecture, and places zero load on the main POS server.
+
+Kiosk Mode: Zero-touch barcode scanning, glowing price/savings display, stock/promo badges, and synthesized audio feedback.
+
+Self-Healing DB: Automatically recovers from schema drift, dynamically patches missing columns, and features a runtime catch & retry engine for zero downtime.
+
+Hardware Optimization: Built for low-cost 2GB tablets. Supports HID USB/Bluetooth wedge capture, persistent auto-refocus mechanisms, and borderless full-screen kiosk mode.
+
+Manual Verifier: Allows instant manual search testing, 1-click quick sample barcodes, live query telemetry, and full product details preview.
+
+3. Operational Workflow
+Startup: Upon launch, the app loads and generates a local mirror of the database, then directs the user to the "Please Scan item Barcode" screen.
+
+Data & Sync Setup (F2):
+Configure the source database type (e.g., SQLite).
+Auto-detect the schema.
+Set the file path for the database.
+Test connection and save.
+Syncing: Click "Start Sync Process" to mirror the data. Once complete, click "Launch Price Verifier" to enter the Kiosk Scanner mode.
+
+Settings & Configuration:
+Add custom logos/images.
+Configure specific source table names and target columns.
+Set auto-launch preferences for the Price Verifier tab.
+Kiosk & Display Preferences: Set Store Name, Currency Symbol, Auto Reset Idle Timeout (e.g., 6 seconds), Admin PIN, and toggle Auto-Sync, Auto-launch, Audio Chime, and Fullscreen Kiosk Mode.
+
+4. Branding & UI Customization
+Theme & Designer: Includes 7 preset enterprise retail themes (Puregold, Mercury Drug, SM Supermarket, Robinsons, Super B, Watson's, Modern Tech Blue).
+Live Theme Engine: Dual-color manipulation (Primary Brand Color for buttons/headers, etc.).
+Brand Simulation: A real-time render preview allows users to see the kiosk screen with custom store titles, taglines, and vector logos before deployment.
+
+Documentation Summary Report 2: Queue Busting Application
+1. Executive Overview
+The QueueBuster POS is a high-speed, zero-friction queue management solution designed for high-traffic retail. It utilizes a Two-Stage Queue-Busting architecture: line busters pre-scan items and print thermal claim slips at a staging station, allowing cashiers to simply scan the slip to collect payment without re-scanning every item.
+
+2. Key Features & Architecture
+Two-Stage System: Staging Station (pre-scan/print) and Payment Counter (scan slip/collect payment). Includes a Quick Switch (F8) to instantly jump to the payment counter.
+Basket & Scanner Controls: Re-scanning auto-increments quantity. Rapid shortcuts (delete or double-click to decrement QTY). Clear basket with confirmation prompts. Live total computation.
+Claim Slip & Thermal Print: Generates high-density Code 128 barcodes with unique 14-digit timestamps. Formatted for mobile/thermal label printers (Zebra, ESC/POS).
+Payment Validation: Sanitized barcode lookup (strips framing noise). Color-coded live feedback (Green=Ready, Red=Insufficient). "Double-Pay Lookout" prevents duplicate payments on paid/cancelled orders.
+Plain-Text Receipts: Monospaced layout supporting 32, 42, or 48-character roll widths. Includes store header, timestamp, itemized lines, cash paid, change, and custom footer.
+Storage & Config: Uses JSON storage (transactions.json) with thread safety. SQLite engine for read-only connections with schema validation. Simple config.txt file remembers printer and DB paths.
+
+3. Operational Workflow
+Setup: Browse and select the Barcode.db file from the Application Dashboard. Select the thermal printer.
+Staging (Scanning): Tap the "Barcode Scan" textbox and begin scanning items.
+Note: Tapping a selected item twice deducts 1 QTY.
+Click "Generate Barcode" to print the claim slip.
+Claim Slip Sample: The slip displays "QUEUE BUSTER CLAIM SLIP", a unique Code, Total Items, Total Amount, and a large scannable barcode. Instruction: "Present this at payment counter."
+Payment Counter: Input or scan the claim slip barcode. The order auto-loads. Input the "Amount Paid" and the system automatically computes the change. Click "Pay & Print Receipt" to finalize.
+Receipt Output: Generates a basic, itemized plain-text receipt for the customer."#;
+
+        let start = std::time::Instant::now();
+        let reply = handle_conversational_rules(today, prompt).expect("should ingest work summary");
+        let elapsed = start.elapsed();
+        println!("\n=== USER WORK SUMMARY GENERATED IN {:?} ===\n{reply}\n========================================", elapsed);
+
+        assert!(!reply.contains("Araneta Mall Linking"));
+        assert!(reply.contains("PriceVerifier Application –"));
+        assert!(reply.contains("Queue Busting Application –"));
+        assert!(reply.contains("8:00 AM – 9:00 AM"));
+        assert!(reply.contains("4:00 PM – 5:00 PM"));
     }
 }

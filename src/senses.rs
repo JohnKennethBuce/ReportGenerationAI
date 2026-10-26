@@ -295,6 +295,7 @@ struct GitCacheState {
     cached_repos: Vec<PathBuf>,
     cached_recent: Vec<String>,
     cached_day_commits: Option<(NaiveDate, Instant, Vec<GitCommit>)>,
+    cached_path_commits: Vec<(PathBuf, Instant, Vec<GitCommit>)>,
 }
 
 fn cache_lock() -> &'static Mutex<GitCacheState> {
@@ -568,12 +569,27 @@ fn git_log_for_dir(dir: &Path, date: NaiveDate) -> Vec<GitCommit> {
 
 /// Retrieve the most recent commits for a specific directory path, including commit body bullets
 /// and modified file basenames (`--name-only`), deduplicating identical subjects for full-day synthesis.
+/// Cached in memory for 60 seconds so 8-hour loops only spawn `git` once per repository.
 pub fn recent_commits_for_path(path: &std::path::Path, limit: usize) -> Vec<GitCommit> {
+    let now = Instant::now();
+    let path_buf = path.to_path_buf();
+    if let Ok(guard) = cache_lock().lock() {
+        if let Some((_, t, cached)) = guard
+            .cached_path_commits
+            .iter()
+            .find(|(p, _, _)| p == &path_buf)
+        {
+            if now.duration_since(*t) < Duration::from_secs(60) && cached.len() >= limit {
+                return cached.iter().take(limit).cloned().collect();
+            }
+        }
+    }
+
     let repo_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "repo".into());
-    let fetch_count = (limit * 2).max(12);
+    let fetch_count = (limit * 2).max(16);
     let output = silent_git_cmd()
         .arg("-C")
         .arg(path)
@@ -742,6 +758,11 @@ pub fn recent_commits_for_path(path: &std::path::Path, limit: usize) -> Vec<GitC
             &mut cur_body_points,
             &mut cur_files,
         );
+    }
+
+    if let Ok(mut guard) = cache_lock().lock() {
+        guard.cached_path_commits.retain(|(p, _, _)| p != &path_buf);
+        guard.cached_path_commits.push((path_buf, now, result.clone()));
     }
 
     result.truncate(limit);
