@@ -10,12 +10,15 @@
 //!   dayrecap --chat       -> native chat & rule manager window (spawned on demand, exits on close)
 //!   dayrecap --report [YYYY-MM-DD|today|yesterday] -> generate daily + active Word/Excel reports and exit
 //!   dayrecap --rules [YYYY-MM-DD|today|yesterday]  -> generate active Word (.docx) & Excel (.xlsx) rule reports
+//!   dayrecap --ask "<prompt>"                      -> headless chat: print DayRecap's reply and exit
 
 mod aggregate;
 mod attachment;
 mod autostart;
 mod chat_ui;
+mod commitplan;
 mod config;
+mod dayplan;
 mod icon;
 mod llm;
 mod office;
@@ -63,6 +66,12 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        Some("--ask") => {
+            // Headless chat: `dayrecap --ask "<prompt>"` prints DayRecap's reply (handy for scripting/testing).
+            let q = args[1..].join(" ");
+            let today = Local::now().date_naive();
+            println!("{}", report::chat_answer(today, &[], &q));
         }
         _ => tray::run(),
     }

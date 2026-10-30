@@ -4,7 +4,9 @@
 
 use crate::{
     aggregate::{self, DaySummary},
+    commitplan::{self, RepoRef},
     config::{self, Config},
+    dayplan::{self, DayPlan, PlanSlot},
     llm::{self, Msg},
     office::{self, ReportRow},
     paths,
@@ -34,6 +36,12 @@ fn cache_generated_rows(date: NaiveDate, rows: &[ReportRow]) {
     }
 }
 
+fn clear_cached_rows() {
+    if let Ok(mut guard) = rows_cache_lock().lock() {
+        *guard = None;
+    }
+}
+
 fn get_cached_rows(date: NaiveDate) -> Option<Vec<ReportRow>> {
     if let Ok(guard) = rows_cache_lock().lock() {
         if let Some((d, ref rows)) = *guard {
@@ -43,6 +51,36 @@ fn get_cached_rows(date: NaiveDate) -> Option<Vec<ReportRow>> {
         }
     }
     None
+}
+
+fn rows_from_dayplan(plan: &DayPlan, rule: &RuleProfile, hours: &[u32]) -> Vec<ReportRow> {
+    let is_findings_target =
+        rule.title_target_col.eq_ignore_ascii_case("Findings") || rule.title_target_col.is_empty();
+    let mut out = Vec::with_capacity(hours.len());
+    for (idx, &h) in hours.iter().enumerate() {
+        let slot = plan
+            .slots
+            .iter()
+            .find(|s| s.hour == h)
+            .or_else(|| plan.slots.get(idx));
+        if let Some(s) = slot {
+            let time_label = scrubber::format_hour_range(h);
+            let cause = if is_findings_target {
+                enforce_clean_cause(&s.cause)
+            } else {
+                enforce_cause_title_prefix(&s.cause, &s.title)
+            };
+            let findings = if is_findings_target {
+                enforce_findings_title_prefix(&s.findings, &s.title, &s.title)
+            } else {
+                s.findings.clone()
+            };
+            out.push(ReportRow {
+                cols: vec![time_label, cause, findings],
+            });
+        }
+    }
+    out
 }
 
 const RULE: &str = "============================================================";
@@ -153,7 +191,30 @@ fn generate_single_rule_report_with_shared_rows(
 
     let rows = if let Some(existing) = precomputed_rows {
         existing.to_vec()
+    } else if let Some(plan) = dayplan::load(date).filter(|p| !p.slots.is_empty()) {
+        let computed = rows_from_dayplan(&plan, rule, &hours);
+        cache_generated_rows(date, &computed);
+        computed
     } else {
+        // Guard against stale text-only `schedule_splits` from a previous day's pasted summary
+        // (where `repo_path` was saved as `""` and today's digest has no `[USER_CAUSE]`):
+        let has_empty_repo_splits = !rule.schedule_splits.is_empty()
+            && rule.schedule_splits.iter().all(|s| s.repo_path.trim().is_empty());
+        let has_today_user_digest = fs::read_to_string(paths::digest_file(date))
+            .map(|s| s.contains("[USER_CAUSE]"))
+            .unwrap_or(false);
+        if has_empty_repo_splits && !has_today_user_digest {
+            let active_today_repos = discover_repos_with_commits_on(date);
+            if !active_today_repos.is_empty() {
+                if let Ok(res) = commitplan::build_commit_plan(&active_today_repos, Some(date), date) {
+                    let _ = dayplan::save(date, &res.plan);
+                    let computed = rows_from_dayplan(&res.plan, rule, &hours);
+                    cache_generated_rows(date, &computed);
+                    return write_rule_report_file(date, rule, is_full_day, &computed).map(|p| (p, computed));
+                }
+            }
+        }
+
         let day = load_summary(date);
         let all_senses = if rule.use_typed_and_copied {
             senses::load_senses(date)
@@ -1183,6 +1244,8 @@ fn handle_conversational_rules_with_history(
         ));
 
         let _ = fs::remove_file(paths::digest_file(date));
+        dayplan::clear(date);
+        clear_cached_rows();
         let files = generate_rule_reports_with_mode(date, true).unwrap_or_default();
         let preview = generate_full_day_table_preview(date);
 
@@ -1201,6 +1264,11 @@ fn handle_conversational_rules_with_history(
             files.iter().map(|p| format!("• {}", p.display())).collect::<Vec<_>>().join("\n"),
             preview
         ));
+    }
+
+    // 5.55 Autonomous Commit-Based Report Planning (Single or Multi-Repo) & Anaphoric Follow-Up ("using it")
+    if let Some(commit_plan_reply) = handle_commit_based_report_or_followup(date, history, q_trim) {
+        return Some(commit_plan_reply);
     }
 
     // 5.6 Autonomous Single-Project Unification, Exclusion, History Resolution & Clarification
@@ -1327,6 +1395,8 @@ fn handle_conversational_rules_with_history(
 
         apply_single_project_to_rules_and_memory(title_name, repo_path, target_col);
         let _ = fs::remove_file(paths::digest_file(date));
+        dayplan::clear(date);
+        clear_cached_rows();
 
         let files = generate_rule_reports_with_mode(date, true).unwrap_or_default();
         let preview = generate_full_day_table_preview(date);
@@ -1497,6 +1567,301 @@ fn handle_conversational_rules_with_history(
                 dissected.sample_rows.len(),
                 dissected.detected_columns.join(" | ")
             ));
+        }
+    }
+
+    None
+}
+
+fn discover_repos_with_commits_on(date: NaiveDate) -> Vec<RepoRef> {
+    let known = commitplan::known_repos();
+    let mut out = Vec::new();
+    for p in known {
+        if !senses::detailed_commits(&p, Some(date), 1).is_empty() {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let title = commitplan::title_for_repo(&p);
+            out.push(RepoRef { name, path: p, title });
+        }
+    }
+    out
+}
+
+fn resolve_repos_from_history(history: &[(bool, String)], date: NaiveDate) -> Vec<RepoRef> {
+    let known = commitplan::known_repos();
+    // 1. Check in-memory conversation history (most recent turn first, both user and assistant)
+    for (_is_user, text) in history.iter().rev() {
+        let resolved = commitplan::resolve_repos_in_text(text, &known);
+        if !resolved.is_empty() {
+            return resolved;
+        }
+    }
+
+    // 2. Fallback: inspect saved chat log for `date` (most recent lines first)
+    if let Ok(raw_chat) = fs::read_to_string(paths::chat_file(date)) {
+        let blocks: Vec<&str> = raw_chat.split("\n[").collect();
+        for block in blocks.into_iter().rev() {
+            let resolved = commitplan::resolve_repos_in_text(block, &known);
+            if !resolved.is_empty() {
+                return resolved;
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+fn execute_commit_plan_report(
+    date: NaiveDate,
+    target_repos: &[RepoRef],
+    prefer_dated_today: bool,
+) -> Option<String> {
+    if target_repos.is_empty() {
+        return None;
+    }
+
+    // Try commits dated `date` first; fall back to latest commits if none exist on `date`
+    let (res, used_today_date) = match commitplan::build_commit_plan(target_repos, Some(date), date) {
+        Ok(r) if prefer_dated_today || r.empty_repos.is_empty() => (r, true),
+        _ => match commitplan::build_commit_plan(target_repos, None, date) {
+            Ok(r) => (r, false),
+            Err(_) => return None,
+        },
+    };
+
+    let _ = dayplan::save(date, &res.plan);
+    let _ = fs::remove_file(paths::digest_file(date));
+    clear_cached_rows();
+
+    // Synchronize rule profiles & monitored project directories
+    if res.used.len() >= 2 {
+        let r1 = &res.used[0].0;
+        let r2 = &res.used[1].0;
+        let r1_path = r1.path.to_string_lossy().to_string();
+        let r2_path = r2.path.to_string_lossy().to_string();
+        if let Some(mut w_rule) = rules::load_rule(rules::RULE_WORD) {
+            w_rule.apply_split_projects(&r1.title, &r1_path, &r2.title, &r2_path);
+            let _ = rules::save_rule(&w_rule);
+        }
+        if let Some(mut e_rule) = rules::load_rule(rules::RULE_EXCEL) {
+            e_rule.apply_split_projects(&r1.title, &r1_path, &r2.title, &r2_path);
+            let _ = rules::save_rule(&e_rule);
+        }
+        let _ = rules::set_project_schedule_memory(&format!(
+            "Commit-Based Multi-Project Plan Configured ({}):\n• Repositories: {}\n• Hour Allocation:\n  {}",
+            if used_today_date {
+                format!("commits dated {}", date.format("%Y-%m-%d"))
+            } else {
+                "latest commits".to_string()
+            },
+            res.used
+                .iter()
+                .map(|(r, _)| format!("{} ({})", r.title, r.path.display()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            res.allocation.join("\n  ")
+        ));
+    } else if let Some((r1, _)) = res.used.first() {
+        apply_single_project_to_rules_and_memory(
+            &r1.title,
+            &r1.path.to_string_lossy(),
+            "Findings",
+        );
+    }
+
+    let mut cfg = config::load();
+    let mut cfg_changed = false;
+    for (r, _) in &res.used {
+        let p_str = r.path.to_string_lossy().to_string();
+        if !cfg
+            .tracking
+            .project_dirs
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(&p_str))
+        {
+            cfg.tracking.project_dirs.push(p_str);
+            cfg_changed = true;
+        }
+    }
+    if cfg_changed {
+        let _ = config::save(&cfg);
+    }
+
+    rules::set_active_rules(
+        date,
+        &[rules::RULE_WORD.to_string(), rules::RULE_EXCEL.to_string()],
+    );
+    let files = generate_rule_reports_with_mode(date, true).unwrap_or_default();
+    let preview = generate_full_day_table_preview(date);
+
+    let mut commit_breakdown = String::new();
+    for (repo, commits) in &res.used {
+        commit_breakdown += &format!(
+            "• **`{}`** (Title: `{}` | Path: `{}`):\n",
+            repo.name,
+            repo.title,
+            repo.path.display()
+        );
+        for c in commits {
+            commit_breakdown += &format!(
+                "  - `[{}]` ({} {}) — {}\n",
+                c.hash,
+                c.date.format("%Y-%m-%d"),
+                c.time.format("%H:%M"),
+                c.subject
+            );
+        }
+    }
+
+    let alloc_lines = res
+        .allocation
+        .iter()
+        .map(|a| format!("  • {a}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let scope_desc = if used_today_date {
+        format!("Commits Dated Today ({})", date.format("%Y-%m-%d"))
+    } else {
+        "Latest Repository Commits".to_string()
+    };
+
+    Some(format!(
+        "✅ **Inspected Git Commits ({scope_desc}) & Generated Full Day 8:00 AM – 5:00 PM schedule Reports!**\n\n\
+         🔍 **Repositories & Commits Grounding Today's Report:**\n\
+         {commit_breakdown}\n\
+         ⏱ **Proportional 8-Hour Allocation (8:00 AM – 5:00 PM):**\n\
+         {alloc_lines}\n\n\
+         📄 **Generated Word (.docx) & Excel (.xlsx) Files:**\n{}\n\n\
+         {}",
+        files
+            .iter()
+            .map(|p| format!("• {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        preview
+    ))
+}
+
+fn handle_commit_based_report_or_followup(
+    date: NaiveDate,
+    history: &[(bool, String)],
+    q_trim: &str,
+) -> Option<String> {
+    let lower = q_trim.to_lowercase();
+    if lower.contains("just mentioned") || lower.contains("clarification") || lower.contains("unsure") {
+        return None;
+    }
+
+    // 1. "What did I do today?" when a DayPlan exists or real Git commits exist on `date`
+    let is_what_did_i_do = lower == "what did i do today?"
+        || lower == "what did i do today"
+        || lower == "what have i done today?"
+        || lower == "what have i done today";
+    if is_what_did_i_do {
+        let today_repos = discover_repos_with_commits_on(date);
+        if !today_repos.is_empty() {
+            return execute_commit_plan_report(date, &today_repos, true);
+        }
+        if dayplan::load(date).filter(|p| !p.slots.is_empty()).is_some() {
+            return Some(generate_full_day_table_preview(date));
+        }
+    }
+
+    let known = commitplan::known_repos();
+    let explicit_repos = commitplan::resolve_repos_in_text(q_trim, &known);
+
+    // 2. Anaphoric follow-up command ("okay now fill my 8-5 reports using it" / "use that" / "with those commits")
+    let is_anaphoric_followup = (lower.contains("fill")
+        || lower.contains("generate")
+        || lower.contains("make")
+        || lower.contains("build")
+        || lower.contains("write")
+        || lower.contains("base"))
+        && (lower.contains("using it")
+            || lower.contains("use it")
+            || lower.contains("with it")
+            || lower.contains("from it")
+            || lower.contains("using that")
+            || lower.contains("use that")
+            || lower.contains("with that")
+            || lower.contains("from that")
+            || lower.contains("using those")
+            || lower.contains("use those")
+            || lower.contains("with those")
+            || lower.contains("those commits"));
+
+    if is_anaphoric_followup {
+        let target_repos = if !explicit_repos.is_empty() {
+            explicit_repos
+        } else {
+            resolve_repos_from_history(history, date)
+        };
+        if !target_repos.is_empty() {
+            return execute_commit_plan_report(date, &target_repos, true);
+        }
+        // If no repos in history yet, check if today has commits across monitored repos
+        let today_repos = discover_repos_with_commits_on(date);
+        if !today_repos.is_empty() && !history.is_empty() {
+            return execute_commit_plan_report(date, &today_repos, true);
+        }
+        return None;
+    }
+
+    // 3. Explicit multi-repo or commit-history report command
+    //    e.g. "Okay don't Write that on my Report And instead inspect all of my Commits on those 2 Repos The MallLinking Repo and XZ_Core. And Base our Report By the Commits history that dated today"
+    let mentions_commits_or_repos = lower.contains("commit")
+        || lower.contains("commits")
+        || lower.contains("repo")
+        || lower.contains("repos")
+        || lower.contains("repository")
+        || lower.contains("repositories")
+        || lower.contains("git");
+    let mentions_report_or_inspect = lower.contains("report")
+        || lower.contains("inspect")
+        || lower.contains("base our")
+        || lower.contains("base my")
+        || lower.contains("base the")
+        || lower.contains("fill")
+        || lower.contains("scan")
+        || lower.contains("dated today");
+
+    if explicit_repos.len() >= 2 && (mentions_commits_or_repos || mentions_report_or_inspect) {
+        let prefer_today = lower.contains("today") || !lower.contains("latest");
+        return execute_commit_plan_report(date, &explicit_repos, prefer_today);
+    }
+
+    // Single repo resolved via `commitplan` that is either a non-MallLinking repo (like `XZ_Core`)
+    // or explicitly asks for commits dated today / base report on commits
+    if explicit_repos.len() == 1 && mentions_commits_or_repos && mentions_report_or_inspect {
+        let r_name_low = explicit_repos[0].name.to_lowercase();
+        let is_non_mall_repo = r_name_low != "malllinking" && r_name_low != "mall_linking";
+        let asks_dated_today = lower.contains("dated today")
+            || lower.contains("commits today")
+            || lower.contains("inspect all of my commits")
+            || lower.contains("base our report")
+            || lower.contains("base my report");
+        if is_non_mall_repo || asks_dated_today {
+            let prefer_today = lower.contains("today") || !lower.contains("latest");
+            return execute_commit_plan_report(date, &explicit_repos, prefer_today);
+        }
+    }
+
+    // No explicit repo named in this sentence, but user asks to base report on commits dated today
+    if explicit_repos.is_empty()
+        && (lower.contains("commit") || lower.contains("commits"))
+        && (lower.contains("dated today")
+            || lower.contains("commits today")
+            || lower.contains("inspect all of my commits"))
+    {
+        let mut target = resolve_repos_from_history(history, date);
+        if target.is_empty() {
+            target = discover_repos_with_commits_on(date);
+        }
+        if !target.is_empty() {
+            return execute_commit_plan_report(date, &target, true);
         }
     }
 
@@ -1754,6 +2119,8 @@ fn handle_single_project_or_clarification(
 
         apply_single_project_to_rules_and_memory(&title, &repo_path, "Findings");
         let _ = fs::remove_file(paths::digest_file(date));
+        dayplan::clear(date);
+        clear_cached_rows();
         rules::set_active_rules(
             date,
             &[rules::RULE_WORD.to_string(), rules::RULE_EXCEL.to_string()],
@@ -1872,6 +2239,8 @@ fn handle_single_project_or_clarification(
     // Unify both rules & memory under this single project
     apply_single_project_to_rules_and_memory(&title, &repo_path, "Findings");
     let _ = fs::remove_file(paths::digest_file(date));
+    dayplan::clear(date);
+    clear_cached_rows();
     rules::set_active_rules(
         date,
         &[rules::RULE_WORD.to_string(), rules::RULE_EXCEL.to_string()],
@@ -2426,6 +2795,36 @@ fn handle_user_provided_work_summary(date: NaiveDate, q_trim: &str) -> Option<St
         }
     }
 
+    // Persist a date-scoped DayPlan so this pasted summary stays isolated to `date`
+    let plan_slots: Vec<PlanSlot> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let slot_title = if blocks.len() >= 2 {
+                if i < 4 {
+                    blocks[0].title()
+                } else {
+                    blocks[1].title()
+                }
+            } else {
+                blocks[0].title()
+            };
+            PlanSlot {
+                hour: hours_num[i],
+                title: slot_title,
+                cause: r.cols.get(1).cloned().unwrap_or_default(),
+                findings: r.cols.get(2).cloned().unwrap_or_default(),
+            }
+        })
+        .collect();
+    let _ = dayplan::save(
+        date,
+        &DayPlan {
+            source: "user-provided work summary".into(),
+            slots: plan_slots,
+        },
+    );
+
     cache_generated_rows(date, &rows);
     rules::set_active_rules(
         date,
@@ -2471,6 +2870,24 @@ fn generate_full_day_table_preview(date: NaiveDate) -> String {
             }
             return out;
         }
+    }
+
+    let word_rule = rules::load_rule(rules::RULE_WORD).unwrap_or_default();
+    let hours = vec![8, 9, 10, 11, 13, 14, 15, 16];
+
+    if let Some(plan) = dayplan::load(date).filter(|p| !p.slots.is_empty()) {
+        let rows = rows_from_dayplan(&plan, &word_rule, &hours);
+        cache_generated_rows(date, &rows);
+        let mut out = String::from(
+            "📋 **Full Day Work Report (8:00 AM – 5:00 PM)**\n\n| Time | Cause | Findings |\n|---|---|---|\n",
+        );
+        for r in &rows {
+            let t = r.cols.first().map(|s| s.as_str()).unwrap_or("");
+            let c = r.cols.get(1).map(|s| s.as_str()).unwrap_or("");
+            let f = r.cols.get(2).map(|s| s.as_str()).unwrap_or("");
+            out += &format!("| {t} | {c} | {f} |\n");
+        }
+        return out;
     }
 
     let cfg = config::load();
@@ -2539,9 +2956,11 @@ pub fn save_chat(date: NaiveDate, who: &str, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn answers_file_access_and_rule_questions() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let today = Local::now().date_naive();
         let reply = handle_conversational_rules(today, "can you access any of my files?");
         assert!(reply.is_some());
@@ -2557,6 +2976,7 @@ mod tests {
 
     #[test]
     fn handles_full_day_request_and_table_preview() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let today = Local::now().date_naive();
         let reply = handle_conversational_rules(today, "can you fill my whole day 8-5 with that report? Make it long");
         assert!(reply.is_some());
@@ -2590,6 +3010,7 @@ mod tests {
 
     #[test]
     fn handles_title_instruction_conversationally() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let today = Local::now().date_naive();
         let reply = handle_conversational_rules(
             today,
@@ -2604,6 +3025,7 @@ mod tests {
 
     #[test]
     fn handles_schedule_split_conversationally() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let today = Local::now().date_naive();
         let prompt = "8-12 Title Enterprise Mall Linking, Folder path to Analyze C:\\Users\\MIS jap\\source\\repos\\MallLinking\n1-5pm Project name Atc & Araneta Mall Linking, path to analyze git C:\\Users\\MIS jap\\source\\repos\\Mall_Linking";
         let reply = handle_conversational_rules(today, prompt);
@@ -2618,6 +3040,7 @@ mod tests {
 
     #[test]
     fn handles_single_project_exclusion_and_history_resolution() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let today = Local::now().date_naive();
 
         // 1. User excludes Atc & Araneta Mall Linking and commands to focus on Enterprise Mall Linking
@@ -2652,6 +3075,7 @@ mod tests {
 
     #[test]
     fn handles_user_provided_work_summary_instantly() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let today = Local::now().date_naive();
         let prompt = r#"here's What I done today 
 
@@ -2721,5 +3145,44 @@ Receipt Output: Generates a basic, itemized plain-text receipt for the customer.
         assert!(reply.contains("Queue Busting Application –"));
         assert!(reply.contains("8:00 AM – 9:00 AM"));
         assert!(reply.contains("4:00 PM – 5:00 PM"));
+    }
+
+    #[test]
+    fn handles_multi_repo_commits_and_anaphoric_followup() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let today = NaiveDate::from_ymd_opt(2026, 10, 29).unwrap();
+
+        // 1. Direct command to inspect commits on MallLinking and XZ_Core dated today
+        let cmd = "Okay don't Write that on my Report And instead inspect all of my Commits on those 2 Repos The MallLinking Repo and XZ_Core. And Base our Report By the Commits history that dated today";
+        let start = std::time::Instant::now();
+        let reply = handle_conversational_rules_with_history(today, &[], cmd)
+            .expect("should handle multi-repo commit report command");
+        let elapsed = start.elapsed();
+        println!(
+            "\n=== MULTI-REPO COMMIT PLAN GENERATED IN {:?} ===\n{reply}\n===============================================",
+            elapsed
+        );
+
+        assert!(reply.contains("Enterprise Mall Linking –"));
+        assert!(reply.contains("XZ_Core –"));
+        assert!(reply.contains("446aed8"));
+        assert!(reply.contains("9fbf86d"));
+        assert!(reply.contains("ab9158e"));
+        assert!(reply.contains("719240d"));
+        assert!(!reply.contains("PriceVerifier Application"));
+        assert!(!reply.contains("Queue Busting Application"));
+
+        // 2. Anaphoric follow-up ("okay now fill my 8-5 reports using it")
+        let history = vec![
+            (true, cmd.to_string()),
+            (false, reply.clone()),
+        ];
+        let followup = "okay now fill my 8-5 reports using it";
+        let followup_reply = handle_conversational_rules_with_history(today, &history, followup)
+            .expect("should handle anaphoric follow-up");
+        assert!(followup_reply.contains("Enterprise Mall Linking –"));
+        assert!(followup_reply.contains("XZ_Core –"));
+        assert!(!followup_reply.contains("PriceVerifier Application"));
+        assert!(!followup_reply.contains("Queue Busting Application"));
     }
 }

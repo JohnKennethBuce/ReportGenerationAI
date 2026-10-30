@@ -567,6 +567,85 @@ fn git_log_for_dir(dir: &Path, date: NaiveDate) -> Vec<GitCommit> {
     result
 }
 
+/// A commit with its full message body and touched files (used for commit-based day plans).
+#[derive(Debug, Clone)]
+pub struct DetailedCommit {
+    pub hash: String,
+    pub time: NaiveTime,
+    pub date: NaiveDate,
+    pub subject: String,
+    pub body: String,
+    pub files: Vec<String>,
+}
+
+/// Strictly READ-ONLY: commits in one repository, either dated `date` (`Some`) or the latest
+/// `limit` commits regardless of date (`None`). Oldest first.
+pub fn detailed_commits(path: &Path, date: Option<NaiveDate>, limit: usize) -> Vec<DetailedCommit> {
+    let mut cmd = silent_git_cmd();
+    cmd.arg("-C").arg(path).arg("log").arg("--no-merges");
+    if let Some(d) = date {
+        let ymd = d.format("%Y-%m-%d").to_string();
+        cmd.arg(format!("--since={ymd} 00:00:00"))
+            .arg(format!("--until={ymd} 23:59:59"));
+    } else {
+        cmd.arg("-n").arg(limit.max(1).to_string());
+    }
+    cmd.arg("--date=format:%Y-%m-%d %H:%M:%S")
+        .arg("--pretty=format:@@COMMIT@@|%h|%ad|%s%n@@BODY@@%n%b%n@@FILES@@")
+        .arg("--name-only");
+
+    let Ok(out) = cmd.output() else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let mut result: Vec<DetailedCommit> = Vec::new();
+    let mut cur: Option<DetailedCommit> = None;
+    let mut in_body = false;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("@@COMMIT@@|") {
+            if let Some(c) = cur.take() {
+                result.push(c);
+            }
+            let mut parts = rest.splitn(3, '|');
+            let hash = parts.next().unwrap_or("").to_string();
+            let stamp = parts.next().unwrap_or("");
+            let subject = parts.next().unwrap_or("").trim().to_string();
+            let dt = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S").ok();
+            cur = Some(DetailedCommit {
+                hash,
+                time: dt.map(|d| d.time()).unwrap_or_else(|| NaiveTime::from_hms_opt(9, 0, 0).unwrap()),
+                date: dt
+                    .map(|d| d.date())
+                    .or(date)
+                    .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+                subject,
+                body: String::new(),
+                files: Vec::new(),
+            });
+            in_body = false;
+        } else if line == "@@BODY@@" {
+            in_body = true;
+        } else if line == "@@FILES@@" {
+            in_body = false;
+        } else if let Some(c) = cur.as_mut() {
+            if in_body {
+                c.body.push_str(line);
+                c.body.push('\n');
+            } else if !line.trim().is_empty() {
+                c.files.push(line.trim().to_string());
+            }
+        }
+    }
+    if let Some(c) = cur.take() {
+        result.push(c);
+    }
+    result.retain(|c| !c.subject.is_empty());
+    result.sort_by_key(|c| (c.date, c.time));
+    result
+}
+
 /// Retrieve the most recent commits for a specific directory path, including commit body bullets
 /// and modified file basenames (`--name-only`), deduplicating identical subjects for full-day synthesis.
 /// Cached in memory for 60 seconds so 8-hour loops only spawn `git` once per repository.
